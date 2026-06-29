@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.venv/
+
+# IDE / Editeurs
+.vscode/
+.idea/
+
+# Fichiers générés par l'application
+reticulaire_interactif.html
+*.png
+*.jpg
+*.jpeg
+
+# Documentation et configuration spécifiques aux Agents IA (LLM)
+AGENTS.md
+.agents/
+.claude/
+.gemini/

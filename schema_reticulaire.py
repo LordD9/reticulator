@@ -364,6 +364,7 @@ def voisinages_stricts(G):
                 "sid": tgt_sid,
                 "dist_m": round(total, 1),
                 "geom": latlon,
+                "geom_m": coords_m,
             })
 
         src_sid = G.nodes[src]["sid"]
