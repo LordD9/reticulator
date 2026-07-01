@@ -731,8 +731,8 @@ def render_interactive_map(figure, height=760):
     <div id="vp" style="width:100%;height:__H__px;overflow:hidden;position:relative;
          border:1px solid #ddd;border-radius:8px;background:#fff;cursor:grab;touch-action:none;">
       <img id="mapimg" src="data:image/png;base64,__B64__" draggable="false"
-           style="position:absolute;top:0;left:0;width:100%;transform-origin:0 0;
-                  user-select:none;-webkit-user-drag:none;"/>
+           style="position:absolute;top:0;left:0;width:100%;height:100%;object-fit:contain;
+                  transform-origin:0 0;user-select:none;-webkit-user-drag:none;"/>
     </div>
     <div style="font-size:12px;color:#666;margin-top:4px;">
       Molette = zoom · glisser = déplacer · double-clic = réinitialiser
