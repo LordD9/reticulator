@@ -1,8 +1,10 @@
 import io
+import base64
 import streamlit as st
+import streamlit.components.v1 as components
 import matplotlib.pyplot as plt
 import matplotlib.patheffects as pe
-from matplotlib.patches import Rectangle, Patch
+from matplotlib.patches import Polygon, Patch
 from matplotlib.lines import Line2D
 import networkx as nx
 import pandas as pd
@@ -218,18 +220,14 @@ for i, od in enumerate(st.session_state.ods):
             )
             od['served_stations'] = served
 
-# --- CADRAGE / ZOOM MANUEL ---
+# --- CADRAGE / ZOOM ---
 st.sidebar.markdown("---")
 st.sidebar.subheader("🔍 Cadrage de la carte")
-manual_zoom = st.sidebar.checkbox("Activer le zoom manuel", value=False,
-                                  help="Permet de zoomer et de se déplacer sur une partie de la carte.")
-zoom_level, pan_x, pan_y = 1.0, 0.5, 0.5
-if manual_zoom:
-    zoom_level = st.sidebar.slider("Niveau de zoom", 1.0, 10.0, 1.0, 0.1)
-    pan_x = st.sidebar.slider("Déplacement horizontal", 0.0, 1.0, 0.5, 0.01,
-                              help="0 = gauche, 1 = droite")
-    pan_y = st.sidebar.slider("Déplacement vertical", 0.0, 1.0, 0.5, 0.01,
-                              help="0 = bas, 1 = haut")
+st.sidebar.caption(
+    "Le zoom est interactif directement sur la carte : **molette** pour zoomer/"
+    "dézoomer sous le curseur, **glisser** pour se déplacer, **double-clic** pour "
+    "réinitialiser."
+)
 
 # --- GENERATION DE LA CARTE ---
 st.title("Générateur de Schéma Réticulaire")
@@ -253,8 +251,9 @@ ax.axis('off')
 # minimum lisible. Utilisée partout (tracé, passages, légende) pour rester cohérent.
 LW_PER_TPH = 2.0
 # Liseré blanc (en points) ajouté de chaque côté de chaque trait de mission
-# pour séparer visuellement les missions empilées côte à côte.
-LISERE_PT = 1.2
+# pour séparer visuellement les missions empilées côte à côte. Volontairement
+# fin : une simple séparation de lisibilité, pas une bande large.
+LISERE_PT = 0.5
 
 def freq_to_lw(freq):
     return max(1.2, freq * LW_PER_TPH)
@@ -302,19 +301,9 @@ margin_y = (maxy - miny) * 0.06 + 5000
 bx0, bx1 = minx - margin_x, maxx + margin_x
 by0, by1 = miny - margin_y, maxy + margin_y
 
-# Zoom manuel : on réduit la fenêtre autour d'un centre piloté par les curseurs.
-if manual_zoom and zoom_level > 1.0:
-    base_w = bx1 - bx0
-    base_h = by1 - by0
-    new_w = base_w / zoom_level
-    new_h = base_h / zoom_level
-    # Le centre se déplace dans la plage où la fenêtre reste incluse dans l'étendue.
-    cx_view = bx0 + new_w / 2 + pan_x * (base_w - new_w)
-    cy_view = by0 + new_h / 2 + pan_y * (base_h - new_h)
-    x0, x1 = cx_view - new_w / 2, cx_view + new_w / 2
-    y0, y1 = cy_view - new_h / 2, cy_view + new_h / 2
-else:
-    x0, x1, y0, y1 = bx0, bx1, by0, by1
+# Cadrage figé sur l'étendue des missions. Le zoom/déplacement se fait ensuite de
+# manière interactive côté navigateur (molette + glisser) sur l'image rendue.
+x0, x1, y0, y1 = bx0, bx1, by0, by1
 
 ax.set_xlim(x0, x1)
 ax.set_ylim(y0, y1)
@@ -361,39 +350,82 @@ for canonical_edge, raw_users in segment_users.items():
             ax.plot(xs, ys, color=od['color'], linewidth=lw, zorder=4,
                     solid_capstyle='round', path_effects=white_outline(lw))
 
-# 7. Gares : rectangles dimensionnés au faisceau de missions (Z-order: 5).
+# 7. Gares : rectangles PERPENDICULAIRES au faisceau de missions (Z-order: 5).
 #    - Bord noir (type a/b) ou gris (c/défaut), fond = couleur du type.
 #    - Le rectangle couvre les missions qui s'ARRÊTENT (trait masqué dessous).
 #    - Les missions sans arrêt seront redessinées par-dessus (étape 8) -> elles
 #      traversent visiblement le rectangle.
-#    La largeur du rectangle s'adapte au nombre de missions traversant et à leur
-#    épaisseur (largeur du faisceau le plus large incident à la gare).
-station_bundle = {}    # sid -> largeur du faisceau le plus large (mètres)
-station_missions = {}  # sid -> set des missions touchant la gare
-for canonical, raw_users in segment_users.items():
+#    Le grand côté du rectangle est orienté perpendiculairement aux traits de
+#    mission et sa longueur vaut la largeur cumulée de TOUTES les missions passant
+#    par la gare (le faisceau incident le plus large) : le rectangle traverse ainsi
+#    exactement l'ensemble des traits empilés, desservis ou non.
+incident_segments = {}   # sid -> [canonical, ...] segments touchant la gare
+station_bundle = {}      # sid -> largeur du faisceau le plus large (mètres)
+station_missions = {}    # sid -> set des missions touchant la gare
+for canonical in segment_users:
     for sid in canonical:
+        incident_segments.setdefault(sid, []).append(canonical)
         station_bundle[sid] = max(station_bundle.get(sid, 0.0), segment_width_m[canonical])
 for od in st.session_state.ods:
     for sid in set(od['steps']):
         station_missions.setdefault(sid, set()).add(od['idx'])
 
-pad_m = meters_per_point * 3
-min_dim = meters_per_point * 9
-station_rects = {}  # sid -> (rx0, ry0, rx1, ry1) bbox du rectangle en mètres
+
+def station_axis(sid):
+    """Direction unitaire (dx, dy) du faisceau de missions le plus large incident
+    à la gare, servant à orienter le rectangle perpendiculairement aux traits.
+    Renvoie (1, 0) par défaut si aucune direction exploitable."""
+    px, py = gares_dict[sid]['x_m'], gares_dict[sid]['y_m']
+    best_w, best_dir = -1.0, (1.0, 0.0)
+    for canonical in incident_segments.get(sid, []):
+        geom = get_edge_geom(canonical[0], canonical[1])
+        L = geom.length
+        if L <= 0:
+            continue
+        step = min(L, max(L * 0.25, 300.0))
+        # La gare est à l'une des deux extrémités de la géométrie centrale.
+        c0, c1 = geom.coords[0], geom.coords[-1]
+        if (c0[0] - px) ** 2 + (c0[1] - py) ** 2 <= (c1[0] - px) ** 2 + (c1[1] - py) ** 2:
+            p_end, p_ref = geom.interpolate(0.0), geom.interpolate(step)
+        else:
+            p_end, p_ref = geom.interpolate(L), geom.interpolate(L - step)
+        vx, vy = p_ref.x - p_end.x, p_ref.y - p_end.y
+        norm = math.hypot(vx, vy)
+        if norm < 1e-6:
+            continue
+        w = segment_width_m[canonical]
+        if w > best_w:
+            best_w, best_dir = w, (vx / norm, vy / norm)
+    return best_dir
+
+
+min_len = meters_per_point * 9      # longueur minimale (petites gares mono-mission)
+bar_thick = meters_per_point * 7    # épaisseur (petit côté) du rectangle de gare
+station_rects = {}  # sid -> (rx0, ry0, rx1, ry1) bbox englobante (anti-collision)
 for sid in drawn_stations:
     info = gares_dict[sid]
     x, y = info['x_m'], info['y_m']
     color = COLORS_TYPE_GARE.get(info['type'], COLORS_TYPE_GARE['default'])
     edge = '#000000' if info['type'] in ('a', 'b') else '#555555'
-    bundle = station_bundle.get(sid, 0.0)
-    w_rect = max(min_dim, bundle + 2 * pad_m)
-    h_rect = max(min_dim * 0.7, w_rect * 0.5)
-    rx, ry = x - w_rect / 2, y - h_rect / 2
-    rect = Rectangle((rx, ry), w_rect, h_rect, facecolor=color, edgecolor=edge,
-                     linewidth=1.2, zorder=5, joinstyle='round')
-    rect.set_clip_on(True)
-    ax.add_patch(rect)
-    station_rects[sid] = (rx, ry, rx + w_rect, ry + h_rect)
+    # Longueur = largeur cumulée du faisceau (missions empilées + liserés).
+    length = max(min_len, station_bundle.get(sid, 0.0))
+    dx, dy = station_axis(sid)          # direction des traits (grand axe du faisceau)
+    nx_, ny_ = -dy, dx                  # normale : axe le long duquel s'empilent les missions
+    hl = length / 2.0                   # demi-longueur (le long de la normale)
+    ht = bar_thick / 2.0                # demi-épaisseur (le long des traits)
+    corners = [
+        (x + ht * dx + hl * nx_, y + ht * dy + hl * ny_),
+        (x + ht * dx - hl * nx_, y + ht * dy - hl * ny_),
+        (x - ht * dx - hl * nx_, y - ht * dy - hl * ny_),
+        (x - ht * dx + hl * nx_, y - ht * dy + hl * ny_),
+    ]
+    poly = Polygon(corners, closed=True, facecolor=color, edgecolor=edge,
+                   linewidth=1.2, zorder=5, joinstyle='round')
+    poly.set_clip_on(True)
+    ax.add_patch(poly)
+    xs_c = [c[0] for c in corners]
+    ys_c = [c[1] for c in corners]
+    station_rects[sid] = (min(xs_c), min(ys_c), max(xs_c), max(ys_c))
 
 # 8. Gares non-desservies (passage sans arrêt) : on redessine un extrait local
 #    de la ligne (mêmes offsets) PAR-DESSUS le rectangle (Z-order: 6) -> le trait
@@ -543,10 +575,50 @@ def build_legend_figure():
 
 fig_legend = build_legend_figure()
 
+def render_interactive_map(figure, height=760):
+    """Affiche la figure comme une image avec zoom/déplacement interactifs côté
+    navigateur : molette pour zoomer sous le curseur, glisser pour se déplacer,
+    double-clic pour réinitialiser. Plus dynamique et naturel que des curseurs."""
+    buf = io.BytesIO()
+    figure.savefig(buf, format="png", dpi=150, bbox_inches='tight')
+    b64 = base64.b64encode(buf.getvalue()).decode()
+    html = """
+    <div id="vp" style="width:100%;height:%(h)dpx;overflow:hidden;position:relative;
+         border:1px solid #ddd;border-radius:8px;background:#fff;cursor:grab;touch-action:none;">
+      <img id="mapimg" src="data:image/png;base64,%(b64)s" draggable="false"
+           style="position:absolute;top:0;left:0;width:100%%;transform-origin:0 0;
+                  user-select:none;-webkit-user-drag:none;"/>
+    </div>
+    <div style="font-size:12px;color:#666;margin-top:4px;">
+      Molette = zoom · glisser = déplacer · double-clic = réinitialiser
+    </div>
+    <script>
+    (function(){
+      var vp=document.getElementById('vp'), img=document.getElementById('mapimg');
+      var scale=1, tx=0, ty=0, panning=false, sx=0, sy=0;
+      function apply(){ img.style.transform='translate('+tx+'px,'+ty+'px) scale('+scale+')'; }
+      vp.addEventListener('wheel', function(e){
+        e.preventDefault();
+        var r=vp.getBoundingClientRect(), mx=e.clientX-r.left, my=e.clientY-r.top;
+        var f=(e.deltaY<0)?1.12:1/1.12, ns=Math.min(25,Math.max(1,scale*f)), k=ns/scale;
+        tx=mx-k*(mx-tx); ty=my-k*(my-ty); scale=ns;
+        if(scale<=1){ scale=1; tx=0; ty=0; }
+        apply();
+      }, {passive:false});
+      vp.addEventListener('mousedown', function(e){ panning=true; sx=e.clientX-tx; sy=e.clientY-ty; vp.style.cursor='grabbing'; });
+      window.addEventListener('mouseup', function(){ panning=false; vp.style.cursor='grab'; });
+      window.addEventListener('mousemove', function(e){ if(!panning)return; tx=e.clientX-sx; ty=e.clientY-sy; apply(); });
+      vp.addEventListener('dblclick', function(){ scale=1; tx=0; ty=0; apply(); });
+    })();
+    </script>
+    """ % {"h": height, "b64": b64}
+    components.html(html, height=height + 40)
+
+
 # --- Affichage Streamlit : carte et légende côte à côte, sans superposition ---
 col_map, col_leg = st.columns([4, 1])
 with col_map:
-    st.pyplot(fig)
+    render_interactive_map(fig)
 with col_leg:
     st.markdown("**Légende**")
     st.pyplot(fig_legend)
