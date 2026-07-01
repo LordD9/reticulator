@@ -725,11 +725,13 @@ def render_interactive_map(figure, height=760):
     buf = io.BytesIO()
     figure.savefig(buf, format="png", dpi=150, bbox_inches='tight')
     b64 = base64.b64encode(buf.getvalue()).decode()
+    # Gabarit avec marqueurs textuels (pas de %-formatting : le HTML/CSS/JS
+    # contient des « % » et des « { } » qui casseraient str.format ou l'opérateur %).
     html = """
-    <div id="vp" style="width:100%;height:%(h)dpx;overflow:hidden;position:relative;
+    <div id="vp" style="width:100%;height:__H__px;overflow:hidden;position:relative;
          border:1px solid #ddd;border-radius:8px;background:#fff;cursor:grab;touch-action:none;">
-      <img id="mapimg" src="data:image/png;base64,%(b64)s" draggable="false"
-           style="position:absolute;top:0;left:0;width:100%%;transform-origin:0 0;
+      <img id="mapimg" src="data:image/png;base64,__B64__" draggable="false"
+           style="position:absolute;top:0;left:0;width:100%;transform-origin:0 0;
                   user-select:none;-webkit-user-drag:none;"/>
     </div>
     <div style="font-size:12px;color:#666;margin-top:4px;">
@@ -754,7 +756,8 @@ def render_interactive_map(figure, height=760):
       vp.addEventListener('dblclick', function(){ scale=1; tx=0; ty=0; apply(); });
     })();
     </script>
-    """ % {"h": height, "b64": b64}
+    """
+    html = html.replace("__H__", str(int(height))).replace("__B64__", b64)
     components.html(html, height=height + 40)
 
 
