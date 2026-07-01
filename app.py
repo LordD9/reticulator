@@ -1,5 +1,6 @@
 import io
 import base64
+from collections import deque
 import streamlit as st
 import streamlit.components.v1 as components
 import matplotlib.pyplot as plt
@@ -220,6 +221,17 @@ for i, od in enumerate(st.session_state.ods):
             )
             od['served_stations'] = served
 
+# --- MODE D'AFFICHAGE ---
+st.sidebar.markdown("---")
+st.sidebar.subheader("🖼️ Mode d'affichage")
+schema_mode = st.sidebar.checkbox(
+    "Mode Schéma (représentation simplifiée)", value=False,
+    help="Remplace le rendu cartographique (fond OSM + tracés réels) par un schéma "
+         "épuré : tracés à angles droits (nord/sud/est/ouest uniquement), gares "
+         "alignées tant que la direction ne change pas, espacement régularisé, et "
+         "toutes les gares nommées. L'affichage ET l'export reprennent cette version.",
+)
+
 # --- CADRAGE / ZOOM ---
 st.sidebar.markdown("---")
 st.sidebar.subheader("🔍 Cadrage de la carte")
@@ -232,9 +244,33 @@ st.sidebar.caption(
 # --- GENERATION DE LA CARTE ---
 st.title("Générateur de Schéma Réticulaire")
 st.markdown("Ce tableau de bord permet de calculer et superposer jusqu'à 8 relations ferroviaires. Les traits se décalent automatiquement s'ils partagent les mêmes voies (Offset), et la hiérarchie visuelle reflète la desserte : **si une gare est décochée (passage sans arrêt), la ligne passe au-dessus du point de la gare**. L'épaisseur des traits est proportionnelle à la fréquence, et lorsque plusieurs missions empruntent les mêmes voies, leurs traits sont empilés côte à côte (jointifs, dans un ordre constant) sans jamais se superposer, quelle que soit l'échelle.")
+if schema_mode:
+    st.info("📐 **Mode Schéma actif** : rendu simplifié à angles droits, gares alignées et espacement régularisé, toutes les gares nommées. L'export reprend cette version.")
+
+# Espacement schématique de référence (unités ~métriques pour rester cohérent
+# avec les marges et conversions mètres<->points existantes).
+SCHEMA_UNIT = 12000.0
+
+
+def schematic_edge_geom(a, b):
+    """Tronçon schématique entre deux gares : segment droit si elles partagent une
+    ligne (même X ou même Y), sinon un coude à angle droit (horizontal puis
+    vertical). Déterministe pour une paire canonique donnée -> les tronçons
+    partagés restent superposables et décalables (offset)."""
+    xa, ya = pos[a]
+    xb, yb = pos[b]
+    eps = SCHEMA_UNIT * 1e-3
+    if abs(xa - xb) < eps or abs(ya - yb) < eps:
+        coords = [(xa, ya), (xb, yb)]
+    else:
+        coords = [(xa, ya), (xb, ya), (xb, yb)]  # coude à angle droit
+    return LineString(coords)
+
 
 def get_edge_geom(u, v):
     canonical = tuple(sorted((u, v)))
+    if schema_mode:
+        return schematic_edge_geom(canonical[0], canonical[1])
     coords = station_graph[canonical[0]][canonical[1]].get('geom_m', [])
     if not coords:
         # Fallback ligne droite
@@ -242,6 +278,86 @@ def get_edge_geom(u, v):
         pt_v = gares_dict[canonical[1]]
         coords = [(pt_u['x_m'], pt_u['y_m']), (pt_v['x_m'], pt_v['y_m'])]
     return LineString(coords)
+
+
+def compute_schematic_layout(stations, segments, gd):
+    """Place les gares sur une grille schématique inspirée de la forme réelle.
+
+    Parcours en largeur du graphe des tronçons empruntés : chaque tronçon est
+    projeté sur l'axe cardinal (horizontal/vertical) dominant de sa direction
+    géographique réelle. Tant que la direction ne change pas, les gares restent
+    donc alignées sur une même ligne ; un changement d'axe crée un angle droit.
+    L'espacement reprend la distance réelle, régularisée (compressée si grande).
+    Renvoie sid -> (X, Y) en unités schématiques."""
+    adj = {s: [] for s in stations}
+    edist = {}
+    for (a, b) in segments:
+        adj.setdefault(a, []).append(b)
+        adj.setdefault(b, []).append(a)
+        d = math.hypot(gd[a]['x_m'] - gd[b]['x_m'], gd[a]['y_m'] - gd[b]['y_m'])
+        edist[(a, b)] = d
+    dvals = sorted(edist.values())
+    med = dvals[len(dvals) // 2] if dvals else 1.0
+    med = med or 1.0
+
+    def spacing(d):
+        # Proportionnel à la distance réelle mais borné : préserve les écarts
+        # relatifs tout en compressant les très longues branches.
+        return SCHEMA_UNIT * min(2.0, max(0.55, d / med))
+
+    cell = SCHEMA_UNIT * 0.25
+
+    def key(p):
+        return (round(p[0] / cell), round(p[1] / cell))
+
+    pos = {}
+    occupied = {}
+
+    def resolve(cand, step):
+        """Décale la gare le long de l'axe perpendiculaire au pas si la cellule
+        est déjà occupée (crée alors un léger coude à angle droit)."""
+        if key(cand) not in occupied:
+            return cand
+        perp = (0.0, SCHEMA_UNIT * 0.5) if step[0] != 0 else (SCHEMA_UNIT * 0.5, 0.0)
+        for k in range(1, 10):
+            for sgn in (1, -1):
+                c = (cand[0] + perp[0] * k * sgn, cand[1] + perp[1] * k * sgn)
+                if key(c) not in occupied:
+                    return c
+        return cand
+
+    remaining = set(stations)
+    comp_offset_x = 0.0
+    while remaining:
+        # Graine = gare la plus au sud-ouest (oriente le schéma « nord en haut »).
+        seed = min(remaining, key=lambda s: (gd[s]['x_m'], gd[s]['y_m']))
+        pos[seed] = (comp_offset_x, 0.0)
+        occupied[key(pos[seed])] = seed
+        q = deque([seed])
+        placed = [seed]
+        while q:
+            u = q.popleft()
+            for v in sorted(adj.get(u, []),
+                            key=lambda z: edist.get(tuple(sorted((u, z))), 0.0)):
+                if v in pos:
+                    continue
+                gdx = gd[v]['x_m'] - gd[u]['x_m']
+                gdy = gd[v]['y_m'] - gd[u]['y_m']
+                L = spacing(math.hypot(gdx, gdy))
+                if abs(gdx) >= abs(gdy):
+                    step = (math.copysign(L, gdx) if gdx else L, 0.0)
+                else:
+                    step = (0.0, math.copysign(L, gdy) if gdy else L)
+                cand = resolve((pos[u][0] + step[0], pos[u][1] + step[1]), step)
+                pos[v] = cand
+                occupied[key(cand)] = v
+                placed.append(v)
+                q.append(v)
+        remaining -= set(placed)
+        # Composante suivante décalée à droite pour éviter tout recouvrement.
+        comp_offset_x = max(pos[s][0] for s in placed) + SCHEMA_UNIT * 3
+
+    return pos
 
 fig, ax = plt.subplots(figsize=(16, 12))
 ax.set_aspect('equal')
@@ -272,19 +388,25 @@ for od in st.session_state.ods:
         canonical = tuple(sorted((u, v)))
         segment_users.setdefault(canonical, []).append(od['idx'])
 
-# 2. Collecter les gares pour le cadrage
-all_xs = []
-all_ys = []
+# 2. Gares dessinées + positions (géographiques ou schématiques selon le mode).
+#    `pos` est la source unique de coordonnées utilisée par tout le rendu.
 drawn_stations = set()
 for od in st.session_state.ods:
     for sid in od['steps']:
         drawn_stations.add(sid)
-        all_xs.append(gares_dict[sid]['x_m'])
-        all_ys.append(gares_dict[sid]['y_m'])
 
-# Réseau ferré complet en fond (Z-order: 1)
-reseau_m = reseau_clip.to_crs(CRS_METRIC)
-reseau_m.plot(ax=ax, color='#d3d3d3', linewidth=1.5, zorder=1)
+if schema_mode and drawn_stations:
+    pos = compute_schematic_layout(drawn_stations, list(segment_users.keys()), gares_dict)
+else:
+    pos = {sid: (gares_dict[sid]['x_m'], gares_dict[sid]['y_m']) for sid in drawn_stations}
+
+all_xs = [pos[s][0] for s in drawn_stations]
+all_ys = [pos[s][1] for s in drawn_stations]
+
+# Réseau ferré complet en fond (Z-order: 1) — uniquement en mode cartographique.
+if not schema_mode:
+    reseau_m = reseau_clip.to_crs(CRS_METRIC)
+    reseau_m.plot(ax=ax, color='#d3d3d3', linewidth=1.5, zorder=1)
 
 if not (all_xs and all_ys):
     ax.text(0.5, 0.5, "Aucune mission configurée", horizontalalignment='center',
@@ -296,8 +418,12 @@ if not (all_xs and all_ys):
 #    autoscale(False) empêche les tracés suivants de modifier l'étendue.
 minx, maxx = min(all_xs), max(all_xs)
 miny, maxy = min(all_ys), max(all_ys)
-margin_x = (maxx - minx) * 0.06 + 5000
-margin_y = (maxy - miny) * 0.06 + 5000
+# Marges plus larges en mode Schéma : toutes les gares sont nommées, il faut de
+# la place autour du dessin pour poser les étiquettes sans les tronquer.
+mfac = 0.12 if schema_mode else 0.06
+madd = SCHEMA_UNIT * 0.7 if schema_mode else 5000
+margin_x = (maxx - minx) * mfac + madd
+margin_y = (maxy - miny) * mfac + madd
 bx0, bx1 = minx - margin_x, maxx + margin_x
 by0, by1 = miny - margin_y, maxy + margin_y
 
@@ -375,7 +501,7 @@ def station_axis(sid):
     """Direction unitaire (dx, dy) du faisceau de missions le plus large incident
     à la gare, servant à orienter le rectangle perpendiculairement aux traits.
     Renvoie (1, 0) par défaut si aucune direction exploitable."""
-    px, py = gares_dict[sid]['x_m'], gares_dict[sid]['y_m']
+    px, py = pos[sid]
     best_w, best_dir = -1.0, (1.0, 0.0)
     for canonical in incident_segments.get(sid, []):
         geom = get_edge_geom(canonical[0], canonical[1])
@@ -404,7 +530,7 @@ bar_thick = meters_per_point * 7    # épaisseur (petit côté) du rectangle de 
 station_rects = {}  # sid -> (rx0, ry0, rx1, ry1) bbox englobante (anti-collision)
 for sid in drawn_stations:
     info = gares_dict[sid]
-    x, y = info['x_m'], info['y_m']
+    x, y = pos[sid]
     color = COLORS_TYPE_GARE.get(info['type'], COLORS_TYPE_GARE['default'])
     edge = '#000000' if info['type'] in ('a', 'b') else '#555555'
     # Longueur = largeur cumulée du faisceau (missions empilées + liserés).
@@ -442,8 +568,7 @@ for od in st.session_state.ods:
         lw = freq_to_lw(od['freq_tph'])
         for sid in (u, v):
             if sid not in od['served_stations']:
-                info = gares_dict[sid]
-                station_pt = Point(info['x_m'], info['y_m'])
+                station_pt = Point(*pos[sid])
                 local_seg = shifted_geom.intersection(station_pt.buffer(catch_radius))
                 if local_seg.is_empty:
                     continue
@@ -455,22 +580,32 @@ for od in st.session_state.ods:
                     ax.plot(xs, ys, color=od['color'], linewidth=lw, zorder=6,
                             solid_capstyle='round', path_effects=white_outline(lw))
 
-# 9. Étiquettes de gares (types a/b) avec anti-collision et trait de rappel.
-#    On évite la superposition entre étiquettes et rectangles, et on garantit que
-#    chaque étiquette reste dans le cadre (donc dans le fond OSM).
+# 9. Étiquettes de gares avec anti-collision et trait de rappel.
+#    - Mode carte : seules les gares de type a/b sont nommées (lisibilité du fond).
+#    - Mode Schéma : TOUTES les gares sont nommées, avec une taille de police
+#      croissante selon le type (a > b > c > autre).
 def _overlap(a, b):
     return not (a[2] <= b[0] or a[0] >= b[2] or a[3] <= b[1] or a[1] >= b[3])
 
-# Limites internes : on garde une petite marge pour rester dans le fond de carte.
+# Limites internes : on garde une petite marge pour rester dans le cadre.
 bound_m = meters_per_point * 2
 lim = (x0 + bound_m, y0 + bound_m, x1 - bound_m, y1 - bound_m)
 
 # bboxes déjà occupées : tous les rectangles de gare.
 occupied = list(station_rects.values())
 
-# On étiquette d'abord les gares de type a (plus prioritaires), puis b.
-to_label = [sid for sid in drawn_stations if gares_dict[sid]['type'] in ('a', 'b')]
-to_label.sort(key=lambda s: 0 if gares_dict[s]['type'] == 'a' else 1)
+# Taille de police par type de gare (mode Schéma).
+FONT_BY_TYPE = {'a': 11, 'b': 9, 'c': 8, 'default': 7}
+type_rank = {'a': 0, 'b': 1, 'c': 2}
+
+if schema_mode:
+    # Toutes les gares, des plus importantes (type a) aux moins prioritaires.
+    to_label = sorted(drawn_stations,
+                      key=lambda s: type_rank.get(gares_dict[s]['type'], 3))
+else:
+    # On étiquette d'abord les gares de type a (plus prioritaires), puis b.
+    to_label = [sid for sid in drawn_stations if gares_dict[sid]['type'] in ('a', 'b')]
+    to_label.sort(key=lambda s: 0 if gares_dict[s]['type'] == 'a' else 1)
 
 gap_lbl = meters_per_point * 4
 # directions candidates (dx, dy) : droite, gauche, haut, bas, puis diagonales.
@@ -478,9 +613,13 @@ DIRECTIONS = [(1, 0), (-1, 0), (0, 1), (0, -1), (1, 1), (-1, 1), (1, -1), (-1, -
 
 for sid in to_label:
     info = gares_dict[sid]
-    x, y = info['x_m'], info['y_m']
-    fontsize = 10 if info['type'] == 'a' else 8
-    fontweight = 'bold' if info['type'] == 'a' else 'normal'
+    x, y = pos[sid]
+    t = info['type']
+    if schema_mode:
+        fontsize = FONT_BY_TYPE.get(t, FONT_BY_TYPE['default'])
+    else:
+        fontsize = 10 if t == 'a' else 8
+    fontweight = 'bold' if t == 'a' else 'normal'
     nom = info['nom']
     # estimation de la taille du texte en mètres
     text_w = max(1, len(nom)) * fontsize * 0.62 * meters_per_point
@@ -491,7 +630,9 @@ for sid in to_label:
 
     placed = None
     is_default = False
-    for r in range(1, 6):
+    # Plus de rayons candidats en mode Schéma : beaucoup plus d'étiquettes à caser.
+    max_r = 9 if schema_mode else 6
+    for r in range(1, max_r):
         for di, (dx, dy) in enumerate(DIRECTIONS):
             offx = (half_rw + text_w / 2 + gap_lbl) * r if dx != 0 else 0
             offy = (half_rh + text_h / 2 + gap_lbl) * r if dy != 0 else 0
@@ -528,11 +669,13 @@ for sid in to_label:
             bbox=dict(facecolor='white', alpha=0.75, edgecolor='none', boxstyle='round,pad=0.2'))
     occupied.append(bbox)
 
-# 10. Fond de carte géographique OSM clair
-try:
-    cx.add_basemap(ax, crs=CRS_METRIC, source=cx.providers.CartoDB.Positron, alpha=0.5, zorder=0)
-except Exception as e:
-    st.warning("Impossible de charger le fond de carte géographique (accès internet requis pour les tuiles).")
+# 10. Fond de carte géographique OSM clair (mode carte uniquement ; le mode
+#     Schéma est volontairement dé-cartographié, sans fond géographique).
+if not schema_mode:
+    try:
+        cx.add_basemap(ax, crs=CRS_METRIC, source=cx.providers.CartoDB.Positron, alpha=0.5, zorder=0)
+    except Exception as e:
+        st.warning("Impossible de charger le fond de carte géographique (accès internet requis pour les tuiles).")
 
 # 11. Légende séparée (figure dédiée) -> aucune collision avec la carte, et
 #     export d'un PNG carte + un PNG légende distincts.
