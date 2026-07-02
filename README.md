@@ -20,10 +20,17 @@ pip install -r requirements.txt
 ```
 
 ## ⚙️ Données d'entrée requises
-L'application s'appuie sur la présence de 3 fichiers sources (non versionnés s'ils sont lourds) dans le dossier du projet :
-- `gare.geojson` : La liste géographique des gares au format WGS 84.
+L'application s'appuie sur la présence de ces fichiers dans le dossier du projet :
+- `gare.geojson` : La liste géographique des gares au format WGS 84, **type de gare inclus** (champ `typeGare` : A / B / C).
 - `reseau_ferroviaire.geojson` : Les géométries du réseau ferré de référence.
-- `donnees_gares.xlsx` : Le fichier de correspondances et d'attributs (code UIC, libellés, typologie de gares, et statistiques de trafic).
+- `regions_departements.json` : Le découpage **région → départements** (code INSEE) servant au périmètre régional. Éditable pour ajuster les périmètres.
+
+> `donnees_gares.xlsx` n'est plus utilisé par l'application : le type de gare est désormais porté directement par `gare.geojson`.
+
+## 🗺️ Périmètre & trajets
+- **Périmètre géographique** (barre latérale) : *Régional* (par défaut — les gares d'une région française, filtrées par département via le code INSEE) ou *France entière* (toutes les gares de `gare.geojson`, premier chargement plus long).
+- **Ajustement manuel des missions** : le routage automatique peut manquer une gare située sur le parcours (ou échouer sur une gare isolée), surtout en périmètre national. Chaque mission dispose donc d'un ajustement manuel permettant d'insérer une gare à une position précise du trajet (ou d'en bâtir un de zéro) et d'en retirer.
+- Seules les gares réellement utilisées par au moins une mission tracée sont affichées.
 
 ## 🏃 Lancement de l'interface
 

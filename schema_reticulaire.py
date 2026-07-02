@@ -25,7 +25,11 @@ from pyproj import Transformer
 # --- Fichiers ---
 FICHIER_GARES_GEOJSON = "gare.geojson"
 FICHIER_RESEAU_GEOJSON = "reseau_ferroviaire.geojson"
-FICHIER_DONNEES_EXCEL = "donnees_gares.xlsx"
+# Découpage région -> départements (code INSEE). Le périmètre régional filtre les
+# gares par leur département (2 premiers chiffres du code INSEE). Le type de gare
+# (A/B/C) est porté directement par gare.geojson : donnees_gares.xlsx n'est plus
+# nécessaire à l'application.
+FICHIER_REGIONS = "regions_departements.json"
 FICHIER_SORTIE_HTML = "reticulaire_interactif.html"
 
 # --- CRS ---
@@ -56,31 +60,71 @@ SIMPLIFY_TOL_M = 40.0        # Douglas-Peucker sur les geoms de voisinage
 # ===================================================================
 # 1. CHARGEMENT
 # ===================================================================
-def charger_donnees():
+def charger_regions():
+    """Renvoie le dict {nom_region: [codes départements]} depuis le fichier JSON."""
+    p = Path(FICHIER_REGIONS)
+    if not p.exists():
+        return {}
+    data = json.loads(p.read_text(encoding="utf-8"))
+    return data.get("regions", {})
+
+
+def noms_regions():
+    """Liste triée des noms de régions disponibles pour le périmètre régional."""
+    return sorted(charger_regions().keys())
+
+
+def _departement_serie(gares_gdf):
+    """Code département (2 car.) de chaque gare : champ ``insee_dep`` en priorité,
+    sinon les 2 premiers chiffres du code commune INSEE (``code_com``)."""
+    dep = gares_gdf.get("insee_dep")
+    dep = dep.astype(str).str.strip() if dep is not None else pd.Series("", index=gares_gdf.index)
+    manquant = dep.isin(["", "nan", "None", "<NA>"])
+    if "code_com" in gares_gdf.columns and manquant.any():
+        dep = dep.mask(manquant, gares_gdf["code_com"].astype(str).str[:2])
+    return dep
+
+
+def charger_donnees(perimetre="Provence-Alpes-Côte d'Azur"):
+    """Charge les gares (depuis gare.geojson uniquement) et le réseau ferré.
+
+    Le type de gare (A/B/C) est lu directement dans gare.geojson (champ
+    ``typeGare``) ; l'ancien fichier Excel n'est plus utilisé.
+
+    perimetre :
+      - "national" : conserve toutes les gares de gare.geojson (réseau entier).
+      - un nom de région (ex. "Provence-Alpes-Côte d'Azur") : ne conserve que les
+        gares dont le département figure dans cette région (voir
+        ``regions_departements.json``).
+    """
     gares_gdf = gpd.read_file(FICHIER_GARES_GEOJSON)
     reseau_gdf = gpd.read_file(FICHIER_RESEAU_GEOJSON)
-    donnees_df = pd.read_excel(FICHIER_DONNEES_EXCEL)
 
     if gares_gdf.crs != CRS_WGS:
         gares_gdf = gares_gdf.to_crs(CRS_WGS)
     if reseau_gdf.crs != CRS_WGS:
         reseau_gdf = reseau_gdf.to_crs(CRS_WGS)
 
-    donnees_df = donnees_df.rename(columns={
-        "codeUic": "code_uic",
-        "nomGare": "nom_gare",
-        "typeGare": "type_gare",
-        "arretsTer2024": "trafic_ter_2024",
-        "Frequentation2024": "freq_2024",
-        "habitants10MinAVelo2023": "pop_10_velo",
-    })
-
     gares_gdf["code_uic"] = gares_gdf["code_uic"].astype(str)
-    donnees_df["code_uic"] = donnees_df["code_uic"].astype(str)
+    # Normalisation du type de gare : gare.geojson mélange 'A'/'B'/'C' et 'c'.
+    gares_gdf["type_gare"] = (
+        gares_gdf["typeGare"].astype(str).str.strip().str.lower()
+    )
 
-    if "nom_gare" in gares_gdf.columns and "nom_gare" in donnees_df.columns:
-        gares_gdf = gares_gdf.drop(columns=["nom_gare"])
-    gares_data = gares_gdf.merge(donnees_df, on="code_uic", how="inner")
+    if perimetre == "national":
+        gares_data = gares_gdf.copy().reset_index(drop=True)
+    else:
+        regions = charger_regions()
+        depts = set(regions.get(perimetre, []))
+        if not depts:
+            raise ValueError(
+                f"Région inconnue ou vide : « {perimetre} ». Régions disponibles : "
+                f"{', '.join(noms_regions()) or '(aucune)'}."
+            )
+        deps_gares = _departement_serie(gares_gdf)
+        gares_data = (
+            gares_gdf[deps_gares.isin(depts)].copy().reset_index(drop=True)
+        )
 
     bounds = gares_data.total_bounds
     minx, miny, maxx, maxy = bounds
@@ -411,6 +455,13 @@ def style_reseau_feature(props):
 # 5. GENERATION HTML
 # ===================================================================
 def serialiser_gares(gares_data):
+    # Les statistiques de trafic (freq/ter/pop) provenaient de l'Excel, désormais
+    # non chargé : on les met à 0 si la colonne est absente.
+    def _stat(g, col):
+        if col in g and pd.notna(g[col]):
+            return int(g[col])
+        return 0
+
     out = []
     for _, g in gares_data.iterrows():
         t = str(g["type_gare"]).lower()
@@ -420,9 +471,9 @@ def serialiser_gares(gares_data):
             "type": t,
             "lat": float(g.geometry.y),
             "lon": float(g.geometry.x),
-            "freq": int(g["freq_2024"]) if pd.notna(g["freq_2024"]) else 0,
-            "ter": int(g["trafic_ter_2024"]) if pd.notna(g["trafic_ter_2024"]) else 0,
-            "pop_velo": int(g["pop_10_velo"]) if pd.notna(g["pop_10_velo"]) else 0,
+            "freq": _stat(g, "freq_2024"),
+            "ter": _stat(g, "trafic_ter_2024"),
+            "pop_velo": _stat(g, "pop_10_velo"),
         })
     return out
 
