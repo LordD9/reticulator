@@ -17,6 +17,7 @@ from schema_reticulaire import (
     charger_donnees,
     construire_graphe,
     voisinages_stricts,
+    noms_regions,
     PALETTE_OD,
     COLORS_TYPE_GARE,
     CRS_METRIC
@@ -64,9 +65,9 @@ def color_conflicts_with_gares(hex_color, seuil=60):
 
 st.set_page_config(page_title="Reticulator - Générateur Interactif", layout="wide")
 
-@st.cache_data
-def load_and_build_graph():
-    gares_data, reseau_clip = charger_donnees()
+@st.cache_data(show_spinner=False)
+def load_and_build_graph(perimetre):
+    gares_data, reseau_clip = charger_donnees(perimetre)
     G, snap_info = construire_graphe(gares_data, reseau_clip)
     neighbors = voisinages_stricts(G)
     
@@ -101,11 +102,39 @@ def load_and_build_graph():
             
     return gares_data, reseau_clip, station_graph, gares_dict, neighbors
 
+# --- PÉRIMÈTRE GÉOGRAPHIQUE ---
+# Choix du périmètre AVANT le chargement : conditionne les données mises en cache.
+st.sidebar.title("🚄 Reticulator")
+st.sidebar.subheader("🗺️ Périmètre géographique")
+_REGIONS = noms_regions()
+_DEFAUT_REGION = "Provence-Alpes-Côte d'Azur"
+mode_perimetre = st.sidebar.radio(
+    "Gares prises en compte",
+    ["Régional", "France entière"],
+    index=0,
+    help="Régional : gares du/des département(s) de la région choisie "
+         "(regions_departements.json). France entière : toutes les gares de "
+         "gare.geojson — le premier chargement du graphe national peut être long.",
+)
+if mode_perimetre == "France entière":
+    perimetre = "national"
+    st.sidebar.warning(
+        "Périmètre national : construction du graphe potentiellement longue et "
+        "gourmande en mémoire au premier chargement. Certaines gares peuvent "
+        "manquer au routage automatique — ajoutez-les à la main dans les missions."
+    )
+else:
+    idx_def = _REGIONS.index(_DEFAUT_REGION) if _DEFAUT_REGION in _REGIONS else 0
+    perimetre = st.sidebar.selectbox(
+        "Région", _REGIONS, index=idx_def,
+        help="Filtre les gares par département (code INSEE) de la région choisie.",
+    )
+
 try:
     with st.spinner("Chargement et construction du graphe géographique..."):
-        gares_data, reseau_clip, station_graph, gares_dict, neighbors = load_and_build_graph()
+        gares_data, reseau_clip, station_graph, gares_dict, neighbors = load_and_build_graph(perimetre)
 except Exception as e:
-    st.error(f"Erreur lors du chargement des données. Veuillez vérifier que les fichiers geojson et xlsx sont présents. Détail : {e}")
+    st.error(f"Erreur lors du chargement des données. Vérifiez la présence de gare.geojson et regions_departements.json. Détail : {e}")
     st.stop()
 
 # --- INITIALISATION SESSION STATE ---
@@ -124,7 +153,8 @@ if 'ods' not in st.session_state:
     st.session_state.ods = ods
 
 # --- UI LATERALE ---
-st.sidebar.title("🚄 Paramétrage des 8 OD")
+st.sidebar.markdown("---")
+st.sidebar.subheader("🚄 Paramétrage des 8 OD")
 
 station_options = [(k, v['nom']) for k, v in gares_dict.items()]
 station_options.sort(key=lambda x: x[1])
@@ -199,6 +229,12 @@ for i, od in enumerate(st.session_state.ods):
                     od['served_stations'] = path.copy()
                     st.success("Trajet calculé avec succès.")
                     st.rerun()
+                except nx.NodeNotFound:
+                    st.error(
+                        "Gare isolée sur le réseau (non reliée par le graphe). "
+                        "Construisez le trajet à la main via l'ajustement manuel "
+                        "ci-dessous."
+                    )
                 except nx.NetworkXNoPath:
                     st.error("Aucun chemin trouvé sur le réseau actuel.")
         
@@ -209,16 +245,75 @@ for i, od in enumerate(st.session_state.ods):
                 od['steps'] = []
                 od['served_stations'] = []
                 st.rerun()
-                
+
             # Sélection des gares spécifiquement desservies
             served = st.multiselect(
-                "Gares desservies (décocher = passage sans arrêt)", 
+                "Gares desservies (décocher = passage sans arrêt)",
                 options=od['steps'],
                 default=od['served_stations'],
                 format_func=format_station,
                 key=f"served_{i}"
             )
             od['served_stations'] = served
+
+        # --- Ajustement manuel du trajet (toujours disponible) ---
+        # Le routage automatique (surtout en périmètre national) peut manquer une
+        # gare pourtant située sur le parcours, voire échouer si une gare est
+        # isolée : on peut alors insérer les gares à la main (y compris pour bâtir
+        # un trajet de zéro) ou en retirer une.
+        st.markdown("**✏️ Ajustement manuel du trajet**")
+        if od['steps']:
+            st.caption("Ordre actuel : " +
+                       " → ".join(format_station(s) for s in od['steps']))
+        else:
+            st.caption("Aucune gare : insérez-les une à une pour bâtir le trajet.")
+        add_g = st.selectbox(
+            "Gare à insérer", [None] + [o[0] for o in station_options],
+            format_func=format_station, index=0, key=f"addg_{i}")
+
+        pos_opts = list(range(len(od['steps']) + 1))
+
+        def _fmt_pos(k, _steps=list(od['steps'])):
+            if not _steps:
+                return "Première gare du trajet"
+            if k == 0:
+                return f"En tête (avant {format_station(_steps[0])})"
+            if k == len(_steps):
+                return f"En queue (après {format_station(_steps[-1])})"
+            return (f"Entre {format_station(_steps[k-1])} "
+                    f"et {format_station(_steps[k])}")
+
+        ins_pos = st.selectbox("Position d'insertion", pos_opts,
+                               index=len(od['steps']), format_func=_fmt_pos,
+                               key=f"addpos_{i}")
+        if st.button("➕ Insérer la gare", key=f"addbtn_{i}", use_container_width=True):
+            if not add_g:
+                st.warning("Choisissez une gare à insérer.")
+            elif add_g in od['steps']:
+                st.warning("Cette gare est déjà présente dans le trajet.")
+            else:
+                od['steps'].insert(ins_pos, add_g)
+                if add_g not in od['served_stations']:
+                    od['served_stations'].append(add_g)
+                od['depart'] = od['steps'][0]
+                od['arrivee'] = od['steps'][-1]
+                st.rerun()
+
+        if od['steps']:
+            rem_g = st.selectbox(
+                "Retirer une gare du trajet", [None] + list(od['steps']),
+                format_func=format_station, index=0, key=f"remg_{i}")
+            if st.button("➖ Retirer la gare", key=f"rembtn_{i}", use_container_width=True):
+                if rem_g:
+                    od['steps'] = [s for s in od['steps'] if s != rem_g]
+                    od['served_stations'] = [s for s in od['served_stations'] if s != rem_g]
+                    if od['steps']:
+                        od['depart'] = od['steps'][0]
+                        od['arrivee'] = od['steps'][-1]
+                    else:
+                        od['depart'] = None
+                        od['arrivee'] = None
+                    st.rerun()
 
 # --- MODE D'AFFICHAGE ---
 st.sidebar.markdown("---")
@@ -270,7 +365,12 @@ def get_edge_geom(u, v):
     canonical = tuple(sorted((u, v)))
     if schema_mode:
         return schematic_edge_geom(canonical[0], canonical[1])
-    coords = station_graph[canonical[0]][canonical[1]].get('geom_m', [])
+    # L'arête peut ne pas exister dans le graphe (gare ajoutée à la main sur un
+    # tronçon que le routage automatique a manqué) -> repli ligne droite.
+    if station_graph.has_edge(canonical[0], canonical[1]):
+        coords = station_graph[canonical[0]][canonical[1]].get('geom_m', [])
+    else:
+        coords = []
     if not coords:
         # Fallback ligne droite
         pt_u = gares_dict[canonical[0]]
@@ -358,33 +458,21 @@ def compute_schematic_layout(stations, segments, gd):
 
     return pos
 
-def _segment_side_sign(geom):
-    """Signe d'orientation (+1 / -1) rendant le côté du décalage cohérent d'un
-    tronçon à l'autre en mode Schéma.
+def oriented_offset(geom, off, canonical):
+    """Décale la géométrie en gardant les traits empilés du même côté relatif au
+    SENS DE PARCOURS de la ligne (mode Schéma uniquement).
 
-    `offset_curve` décale à gauche du sens coords[0]->coords[-1]. Or la géométrie
-    schématique suit l'ordre canonique des sid (indépendant du sens de parcours
-    d'une mission) : une même mission peut donc basculer de gauche à droite en
-    traversant une gare, ce qui inverse visuellement l'ordre des traits empilés.
-    On réoriente la normale vers un hémisphère fixe (~NE) : l'empilement reste
-    ainsi du même côté géographique sur tout le réseau, sans croisement parasite."""
-    coords = list(geom.coords)
-    dx = coords[-1][0] - coords[0][0]
-    dy = coords[-1][1] - coords[0][1]
-    nx_, ny_ = -dy, dx          # normale à gauche du sens de tracé
-    s = nx_ + ny_
-    if abs(s) < 1e-9:           # tronçon orienté NO-SE : on départage
-        s = nx_ - ny_
-    if abs(s) < 1e-9:
-        s = nx_
-    return 1.0 if s >= 0 else -1.0
-
-
-def oriented_offset(geom, off):
-    """Décale la géométrie en gardant un côté cohérent (mode Schéma uniquement ;
-    en mode carte, les tracés suivent la géométrie réelle et restent lissés)."""
+    `offset_curve` décale à gauche du sens coords[0]->coords[-1], c.-à-d. de
+    l'ordre canonique des sid — indépendant du sens réel de parcours des missions.
+    Résultat : à un changement de direction (coude) ou à une gare où l'ordre des
+    sid s'inverse, une mission bascule de gauche à droite et les traits se
+    croisent. On rétablit donc, pour chaque tronçon, une orientation alignée sur
+    le sens de parcours de la mission « meneuse » (plus petit indice) qui
+    l'emprunte : les bandes tournent les coudes de façon concentrique, sans
+    croisement, et gardent un ordre constant sur tout le tracé. En mode carte, la
+    géométrie réelle est conservée telle quelle (pas de réorientation)."""
     if schema_mode:
-        off = off * _segment_side_sign(geom)
+        off = off * segment_sign.get(canonical, 1.0)
     return offset_line(geom, off)
 
 
@@ -419,8 +507,14 @@ for od in st.session_state.ods:
 
 # 2. Gares dessinées + positions (géographiques ou schématiques selon le mode).
 #    `pos` est la source unique de coordonnées utilisée par tout le rendu.
+#    On ne dessine QUE les gares réellement utilisées par au moins une mission
+#    tracée (mission d'au moins 2 gares, donc portant un tronçon) : une gare
+#    présente dans une mission incomplète ou sur le trajet mais utilisée par
+#    aucune mission n'est pas affichée.
 drawn_stations = set()
 for od in st.session_state.ods:
+    if len(od['steps']) < 2:
+        continue
     for sid in od['steps']:
         drawn_stations.add(sid)
 
@@ -490,12 +584,33 @@ for canonical, raw_users in segment_users.items():
         segment_offsets[(canonical, idx)] = cursor + w / 2.0
         cursor += w + gap_m
 
+# 5bis. Sens de décalage par tronçon (mode Schéma) : aligné sur le sens de
+#    parcours de la mission meneuse (plus petit indice) empruntant le tronçon.
+#    La géométrie schématique est tracée dans l'ordre canonique des sid
+#    (canonical[0] -> canonical[1]) ; si la meneuse le parcourt dans l'autre sens,
+#    on inverse le signe pour que la bande reste du même côté relatif au parcours
+#    -> pas de croisement aux coudes / aux inversions d'ordre de sid.
+segment_sign = {}   # canonical -> +1.0 / -1.0
+for canonical, raw_users in segment_users.items():
+    a, b = canonical                      # a < b, sens canonique de la géométrie
+    lead_steps = st.session_state.ods[min(raw_users)]['steps']
+    sgn = 1.0
+    for i in range(len(lead_steps) - 1):
+        pair = (lead_steps[i], lead_steps[i + 1])
+        if pair == (a, b):
+            sgn = 1.0
+            break
+        if pair == (b, a):                # meneuse à contre-sens du sens canonique
+            sgn = -1.0
+            break
+    segment_sign[canonical] = sgn
+
 # 6. Lignes de mission (Z-order: 4) avec liseré blanc
 for canonical_edge, raw_users in segment_users.items():
     geom = get_edge_geom(canonical_edge[0], canonical_edge[1])
     for od_idx in sorted(raw_users):
         od = st.session_state.ods[od_idx]
-        shifted_geom = oriented_offset(geom, segment_offsets[(canonical_edge, od_idx)])
+        shifted_geom = oriented_offset(geom, segment_offsets[(canonical_edge, od_idx)], canonical_edge)
         if shifted_geom.is_empty:
             continue
         lw = freq_to_lw(od['freq_tph'])
@@ -593,7 +708,7 @@ for od in st.session_state.ods:
         v = od['steps'][i+1]
         canonical = tuple(sorted((u, v)))
         shifted_geom = oriented_offset(get_edge_geom(canonical[0], canonical[1]),
-                                       segment_offsets[(canonical, od['idx'])])
+                                       segment_offsets[(canonical, od['idx'])], canonical)
         lw = freq_to_lw(od['freq_tph'])
         for sid in (u, v):
             if sid not in od['served_stations']:
