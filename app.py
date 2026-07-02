@@ -1,5 +1,4 @@
 import io
-import base64
 from collections import deque
 import streamlit as st
 import streamlit.components.v1 as components
@@ -359,6 +358,36 @@ def compute_schematic_layout(stations, segments, gd):
 
     return pos
 
+def _segment_side_sign(geom):
+    """Signe d'orientation (+1 / -1) rendant le côté du décalage cohérent d'un
+    tronçon à l'autre en mode Schéma.
+
+    `offset_curve` décale à gauche du sens coords[0]->coords[-1]. Or la géométrie
+    schématique suit l'ordre canonique des sid (indépendant du sens de parcours
+    d'une mission) : une même mission peut donc basculer de gauche à droite en
+    traversant une gare, ce qui inverse visuellement l'ordre des traits empilés.
+    On réoriente la normale vers un hémisphère fixe (~NE) : l'empilement reste
+    ainsi du même côté géographique sur tout le réseau, sans croisement parasite."""
+    coords = list(geom.coords)
+    dx = coords[-1][0] - coords[0][0]
+    dy = coords[-1][1] - coords[0][1]
+    nx_, ny_ = -dy, dx          # normale à gauche du sens de tracé
+    s = nx_ + ny_
+    if abs(s) < 1e-9:           # tronçon orienté NO-SE : on départage
+        s = nx_ - ny_
+    if abs(s) < 1e-9:
+        s = nx_
+    return 1.0 if s >= 0 else -1.0
+
+
+def oriented_offset(geom, off):
+    """Décale la géométrie en gardant un côté cohérent (mode Schéma uniquement ;
+    en mode carte, les tracés suivent la géométrie réelle et restent lissés)."""
+    if schema_mode:
+        off = off * _segment_side_sign(geom)
+    return offset_line(geom, off)
+
+
 fig, ax = plt.subplots(figsize=(16, 12))
 ax.set_aspect('equal')
 ax.axis('off')
@@ -466,7 +495,7 @@ for canonical_edge, raw_users in segment_users.items():
     geom = get_edge_geom(canonical_edge[0], canonical_edge[1])
     for od_idx in sorted(raw_users):
         od = st.session_state.ods[od_idx]
-        shifted_geom = offset_line(geom, segment_offsets[(canonical_edge, od_idx)])
+        shifted_geom = oriented_offset(geom, segment_offsets[(canonical_edge, od_idx)])
         if shifted_geom.is_empty:
             continue
         lw = freq_to_lw(od['freq_tph'])
@@ -563,8 +592,8 @@ for od in st.session_state.ods:
         u = od['steps'][i]
         v = od['steps'][i+1]
         canonical = tuple(sorted((u, v)))
-        shifted_geom = offset_line(get_edge_geom(canonical[0], canonical[1]),
-                                   segment_offsets[(canonical, od['idx'])])
+        shifted_geom = oriented_offset(get_edge_geom(canonical[0], canonical[1]),
+                                       segment_offsets[(canonical, od['idx'])])
         lw = freq_to_lw(od['freq_tph'])
         for sid in (u, v):
             if sid not in od['served_stations']:
@@ -586,6 +615,16 @@ for od in st.session_state.ods:
 #      croissante selon le type (a > b > c > autre).
 def _overlap(a, b):
     return not (a[2] <= b[0] or a[0] >= b[2] or a[3] <= b[1] or a[1] >= b[3])
+
+
+def _overlap_area(a, b):
+    """Aire de recouvrement de deux bboxes (0 si disjointes) — sert à choisir la
+    position de repli la moins conflictuelle quand aucune place libre n'existe."""
+    dx = min(a[2], b[2]) - max(a[0], b[0])
+    dy = min(a[3], b[3]) - max(a[1], b[1])
+    if dx <= 0 or dy <= 0:
+        return 0.0
+    return dx * dy
 
 # Limites internes : on garde une petite marge pour rester dans le cadre.
 bound_m = meters_per_point * 2
@@ -652,11 +691,39 @@ for sid in to_label:
             break
 
     if placed is None:
-        # repli : à droite, position par défaut même si imparfaite (clampée au cadre)
-        cx_l = min(max(x + half_rw + text_w / 2 + gap_lbl, lim[0] + text_w / 2), lim[2] - text_w / 2)
-        cy_l = min(max(y, lim[1] + text_h / 2), lim[3] - text_h / 2)
-        bbox = (cx_l - text_w / 2, cy_l - text_h / 2, cx_l + text_w / 2, cy_l + text_h / 2)
-        placed = (cx_l, cy_l, bbox)
+        # Repli : balayage d'une grille sur tout le cadre. On retient l'emplacement
+        # LIBRE le plus proche de la gare ; si aucun n'est libre (cadre saturé), on
+        # prend le moins chevauchant. Évite les étiquettes qui se superposent
+        # franchement en mode Schéma (toutes les gares étant nommées).
+        step = max(text_h * 0.6, meters_per_point * 5)
+        best_free = None
+        best_free_d = None
+        best_any = None
+        best_ov = None
+        gx = lim[0] + text_w / 2
+        while gx <= lim[2] - text_w / 2:
+            gy = lim[1] + text_h / 2
+            while gy <= lim[3] - text_h / 2:
+                bbox = (gx - text_w / 2, gy - text_h / 2,
+                        gx + text_w / 2, gy + text_h / 2)
+                ov = sum(_overlap_area(bbox, o) for o in occupied)
+                d = (gx - x) ** 2 + (gy - y) ** 2
+                if ov == 0.0:
+                    if best_free_d is None or d < best_free_d:
+                        best_free_d = d
+                        best_free = (gx, gy, bbox)
+                if best_ov is None or ov < best_ov:
+                    best_ov = ov
+                    best_any = (gx, gy, bbox)
+                gy += step
+            gx += step
+        placed = best_free if best_free is not None else best_any
+        if placed is None:
+            # Cadre plus étroit que l'étiquette : clamp simple à droite de la gare.
+            cx_l = min(max(x + half_rw + text_w / 2 + gap_lbl, lim[0] + text_w / 2), lim[2] - text_w / 2)
+            cy_l = min(max(y, lim[1] + text_h / 2), lim[3] - text_h / 2)
+            bbox = (cx_l - text_w / 2, cy_l - text_h / 2, cx_l + text_w / 2, cy_l + text_h / 2)
+            placed = (cx_l, cy_l, bbox)
         is_default = False
 
     cx_l, cy_l, bbox = placed
@@ -719,20 +786,36 @@ def build_legend_figure():
 fig_legend = build_legend_figure()
 
 def render_interactive_map(figure, height=760):
-    """Affiche la figure comme une image avec zoom/déplacement interactifs côté
+    """Affiche la figure en SVG (vectoriel) avec zoom/déplacement interactifs côté
     navigateur : molette pour zoomer sous le curseur, glisser pour se déplacer,
-    double-clic pour réinitialiser. Plus dynamique et naturel que des curseurs."""
-    buf = io.BytesIO()
-    figure.savefig(buf, format="png", dpi=150, bbox_inches='tight')
-    b64 = base64.b64encode(buf.getvalue()).decode()
+    double-clic pour réinitialiser.
+
+    Le rendu est vectoriel : en zoomant, le navigateur re-rastérise réellement le
+    tracé à la nouvelle échelle (traits, gares et étiquettes restent nets), au lieu
+    d'agrandir les pixels d'une image figée. On zoome donc « pour de vrai »."""
+    buf = io.StringIO()
+    figure.savefig(buf, format="svg", bbox_inches='tight')
+    svg = buf.getvalue()
+    # On isole la balise <svg …> (retrait de l'entête XML/DOCTYPE) puis on lui
+    # injecte un id + un style pour qu'elle remplisse le cadre et accepte le
+    # transform CSS piloté en JS. Les largeurs/hauteurs en pt de matplotlib sont
+    # surchargées par le style (width/height 100 %), le viewBox gère le ratio.
+    start = svg.find('<svg')
+    if start > 0:
+        svg = svg[start:]
+    svg = svg.replace(
+        '<svg ',
+        '<svg id="mapimg" preserveAspectRatio="xMidYMid meet" '
+        'style="position:absolute;top:0;left:0;width:100%;height:100%;'
+        'transform-origin:0 0;user-select:none;" ',
+        1,
+    )
     # Gabarit avec marqueurs textuels (pas de %-formatting : le HTML/CSS/JS
     # contient des « % » et des « { } » qui casseraient str.format ou l'opérateur %).
     html = """
     <div id="vp" style="width:100%;height:__H__px;overflow:hidden;position:relative;
          border:1px solid #ddd;border-radius:8px;background:#fff;cursor:grab;touch-action:none;">
-      <img id="mapimg" src="data:image/png;base64,__B64__" draggable="false"
-           style="position:absolute;top:0;left:0;width:100%;height:100%;object-fit:contain;
-                  transform-origin:0 0;user-select:none;-webkit-user-drag:none;"/>
+      __SVG__
     </div>
     <div style="font-size:12px;color:#666;margin-top:4px;">
       Molette = zoom · glisser = déplacer · double-clic = réinitialiser
@@ -745,7 +828,7 @@ def render_interactive_map(figure, height=760):
       vp.addEventListener('wheel', function(e){
         e.preventDefault();
         var r=vp.getBoundingClientRect(), mx=e.clientX-r.left, my=e.clientY-r.top;
-        var f=(e.deltaY<0)?1.12:1/1.12, ns=Math.min(25,Math.max(1,scale*f)), k=ns/scale;
+        var f=(e.deltaY<0)?1.12:1/1.12, ns=Math.min(40,Math.max(1,scale*f)), k=ns/scale;
         tx=mx-k*(mx-tx); ty=my-k*(my-ty); scale=ns;
         if(scale<=1){ scale=1; tx=0; ty=0; }
         apply();
@@ -757,7 +840,7 @@ def render_interactive_map(figure, height=760):
     })();
     </script>
     """
-    html = html.replace("__H__", str(int(height))).replace("__B64__", b64)
+    html = html.replace("__H__", str(int(height))).replace("__SVG__", svg)
     components.html(html, height=height + 40)
 
 
