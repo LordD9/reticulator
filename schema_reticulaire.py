@@ -503,8 +503,8 @@ def signes_offset_corridor(liste_steps):
     On propage un référentiel le long des tronçons *consécutifs* d'une même
     mission : le rang (indice de mission, ordre d'empilement) reste du même
     côté du faisceau d'un bout à l'autre, y compris aux coudes, quand une
-    mission ne dessert pas les gares intermédiaires, et en mode carte comme
-    en mode schéma.
+    mission ne dessert pas les gares intermédiaires. Utilisé en mode carte ;
+    le mode schéma passe par `offsets_faisceau_schematique`.
 
     `liste_steps[i]` = séquence de gares de la mission d'indice i.
     Renvoie `{ (sid_min, sid_max): +1.0 | -1.0 }`.
@@ -549,6 +549,217 @@ def signes_offset_corridor(liste_steps):
                 remaining.discard(e2)
                 q.append(e2)
     return signs
+
+
+def _parties_hv(geom, eps):
+    """Découpe une LineString en segments horizontaux / verticaux.
+
+    Chaque élément est `(axis, qcoord, tmin, tmax, LineString)` avec
+    `axis` = `'h'` ou `'v'`, `qcoord` la coordonnée constante, et
+    `[tmin, tmax]` l'intervalle sur l'autre axe.
+    """
+    if geom is None or geom.is_empty:
+        return []
+    coords = list(geom.coords)
+    parts = []
+    for (x0, y0), (x1, y1) in zip(coords, coords[1:]):
+        dx, dy = x1 - x0, y1 - y0
+        if abs(dx) < eps and abs(dy) < eps:
+            continue
+        if abs(dx) < abs(dy):
+            parts.append(('v', 0.5 * (x0 + x1), min(y0, y1), max(y0, y1),
+                          LineString([(x0, y0), (x1, y1)])))
+        else:
+            parts.append(('h', 0.5 * (y0 + y1), min(x0, x1), max(x0, x1),
+                          LineString([(x0, y0), (x1, y1)])))
+    return parts
+
+
+def _qkey(qcoord, eps):
+    """Quantifie une coordonnée pour regrouper les rails colinéaires."""
+    if eps <= 0:
+        return qcoord
+    return round(qcoord / eps)
+
+
+def offsets_faisceau_schematique(geoms, segment_users, liste_steps, pos,
+                                 widths, eps):
+    """Offsets schématiques : faisceaux colinéaires + signe d'axe unifié.
+
+    En mode schéma, deux missions peuvent occuper le même axe (même X ou
+    même Y) sans partager la même paire de gares — typiquement une ligne
+    côtière et une ligne intérieure qui descendent toutes deux vers le
+    terminus. L'offset par arête canonique les superpose. On fusionne
+    donc les tronçons *colinéaires et sécants* en un seul faisceau.
+
+    Le décalage est une translation monde (X pour un vertical, Y pour un
+    horizontal), pas `offset_curve` : le sens UIC min→max d'une arête
+    schématique n'est pas celui du rail géographique, et deux arêtes
+    d'un même axe peuvent pointer à l'opposé.
+
+    Convention (identique à `signes_offset_corridor` + `offset_curve`) :
+    l'indice de mission le plus petit se place à *droite* du parcours.
+    Le signe est propagé de rail à rail aux coudes pour que l'ordre ne
+    s'inverse pas.
+
+    `geoms` : `{canonical: LineString}` déjà en coordonnées schématiques.
+    `widths` : `{od_idx: largeur}` dans la même unité que `pos`.
+    Renvoie `(shifts, width_m)` avec
+    `shifts[(canonical, od_idx)] = (ox, oy)` et `width_m[canonical]` la
+    largeur de faisceau (max sur les parties de l'arête).
+    """
+    # Parties dessinables + sens de parcours monde de chaque mission.
+    # t = +1 si la mission parcourt le rail dans le sens de référence
+    # (nord pour un vertical, est pour un horizontal).
+    occupancy = []  # (axis, qkey, tmin, tmax, canonical, od_idx)
+    parts_of = {}   # (canonical, od_idx) -> [(axis, qkey, tmin, tmax)]
+    travel_group = {}  # (axis, qkey, od_idx) -> ±1
+    touch = {}      # (canonical, od_idx, sid) -> set(group)
+
+    def _near(part_tmin, part_tmax, axis, qcoord, sid):
+        if sid not in pos:
+            return False
+        x, y = pos[sid]
+        if axis == 'v':
+            return abs(x - qcoord) <= eps and (part_tmin - eps) <= y <= (part_tmax + eps)
+        return abs(y - qcoord) <= eps and (part_tmin - eps) <= x <= (part_tmax + eps)
+
+    for canonical, raw_users in segment_users.items():
+        geom = geoms.get(canonical)
+        if geom is None or geom.is_empty:
+            continue
+        hv = _parties_hv(geom, eps)
+        if not hv:
+            continue
+        # qcoord "officiel" du rail : moyenne des parties du même axe,
+        # pour que deux arêtes quasi-alignées partagent la même clé.
+        q_acc = {'h': [], 'v': []}
+        for axis, qcoord, tmin, tmax, _ls in hv:
+            q_acc[axis].append(qcoord)
+        q_mean = {ax: (sum(vs) / len(vs) if vs else 0.0) for ax, vs in q_acc.items()}
+
+        for od_idx in raw_users:
+            steps = liste_steps[od_idx] if od_idx < len(liste_steps) else []
+            # Sens de parcours a → b (pas l'ordre UIC).
+            a, b = canonical
+            t_h = t_v = 0.0
+            for s0, s1 in zip(steps, steps[1:]):
+                if tuple(sorted((s0, s1))) != canonical:
+                    continue
+                x0, y0 = pos[s0]
+                x1, y1 = pos[s1]
+                if abs(x1 - x0) > eps:
+                    t_h = 1.0 if x1 > x0 else -1.0
+                if abs(y1 - y0) > eps:
+                    t_v = 1.0 if y1 > y0 else -1.0
+                break
+            t_of = {'h': t_h, 'v': t_v}
+            key_parts = []
+            for axis, qcoord, tmin, tmax, _ls in hv:
+                qcoord = q_mean[axis]
+                qk = _qkey(qcoord, eps)
+                t = t_of[axis]
+                occupancy.append((axis, qk, tmin, tmax, canonical, od_idx))
+                key_parts.append((axis, qk, tmin, tmax, qcoord))
+                if t != 0.0:
+                    travel_group[(axis, qk, od_idx)] = t
+                group = (axis, qk)
+                for sid in canonical:
+                    if _near(tmin, tmax, axis, qcoord, sid):
+                        touch.setdefault((canonical, od_idx, sid), set()).add(group)
+            parts_of[(canonical, od_idx)] = key_parts
+
+    def _overlap(a0, a1, b0, b1):
+        return min(a1, b1) - max(a0, b0) > eps
+
+    # Pour chaque partie, missions dont l'intervalle recouvre celui-ci
+    # sur le même rail (même axe, même coordonnée quantifiée).
+    bundle_users = {}  # (canonical, od_idx, axis, qkey, tmin, tmax) -> [idx]
+    bundle_width = {}  # canonical -> largeur max
+    group_users = defaultdict(set)  # (axis, qkey) -> set(od_idx)
+
+    for rec in occupancy:
+        axis, qk, tmin, tmax, canonical, od_idx = rec
+        users = set()
+        for axis2, qk2, u0, u1, _c2, idx2 in occupancy:
+            if axis2 != axis or qk2 != qk:
+                continue
+            if _overlap(tmin, tmax, u0, u1):
+                users.add(idx2)
+        ordered = sorted(users)
+        bundle_users[(canonical, od_idx, axis, qk, tmin, tmax)] = ordered
+        group_users[(axis, qk)].add(od_idx)
+        total = sum(widths.get(i, 0.0) for i in ordered)
+        bundle_width[canonical] = max(bundle_width.get(canonical, 0.0), total)
+
+    def _centered(users):
+        ws = [widths.get(i, 0.0) for i in users]
+        total = sum(ws)
+        cursor = -total / 2.0
+        out = {}
+        for idx, w in zip(users, ws):
+            out[idx] = cursor + w / 2.0
+            cursor += w
+        return out
+
+    # Signe par rail, propagé aux coudes via les missions qui changent d'axe.
+    adj = defaultdict(list)  # group -> [(group2, od_idx)]
+    for idx, steps in enumerate(liste_steps):
+        if not steps or len(steps) < 2:
+            continue
+        edges = [tuple(sorted((a, b))) for a, b in zip(steps, steps[1:])]
+        for e1, e2, shared in zip(edges, edges[1:], steps[1:]):
+            g1 = touch.get((e1, idx, shared), set())
+            g2 = touch.get((e2, idx, shared), set())
+            for ga in g1:
+                for gb in g2:
+                    if ga != gb:
+                        adj[ga].append((gb, idx))
+                        adj[gb].append((ga, idx))
+
+    def _t_on_group(group, idx):
+        return travel_group.get((group[0], group[1], idx), 0.0)
+
+    signs = {}
+    remaining = set(group_users)
+    while remaining:
+        seed = min(remaining)
+        lead = min(group_users[seed])
+        t_lead = _t_on_group(seed, lead)
+        signs[seed] = t_lead if t_lead != 0.0 else 1.0
+        remaining.remove(seed)
+        q = deque([seed])
+        while q:
+            g = q.popleft()
+            for g2, mid in adj.get(g, []):
+                if g2 in signs or g2 not in group_users:
+                    continue
+                t1 = _t_on_group(g, mid)
+                t2 = _t_on_group(g2, mid)
+                if t1 == 0.0 or t2 == 0.0:
+                    continue
+                signs[g2] = signs[g] * t1 * t2
+                remaining.discard(g2)
+                q.append(g2)
+
+    # Translation monde : d > 0 = gauche du sens de référence
+    # (ouest pour un vertical nord, nord pour un horizontal est).
+    shifts = {}
+    for (canonical, od_idx), parts in parts_of.items():
+        ox = oy = 0.0
+        for axis, qk, tmin, tmax, _qc in parts:
+            users = bundle_users.get((canonical, od_idx, axis, qk, tmin, tmax),
+                                     [od_idx])
+            assigned = _centered(users).get(od_idx, 0.0)
+            sgn = signs.get((axis, qk), 1.0)
+            d = assigned * sgn
+            if axis == 'v':
+                ox = -d
+            else:
+                oy = d
+        shifts[(canonical, od_idx)] = (ox, oy)
+
+    return shifts, bundle_width
 
 
 # ===================================================================
@@ -715,9 +926,9 @@ const DATA = __DATA_BLOB__;
 
 // ----- 1. CARTE -----
 const map = L.map('map', { preferCanvas:true }).setView(DATA.center, 8);
-L.tileLayer('https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png', {
-  attribution:'&copy; OpenStreetMap, &copy; CartoDB',
-  maxZoom:18
+L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Light_Gray_Base/MapServer/tile/{z}/{y}/{x}', {
+  attribution:'Tiles &copy; Esri &mdash; Esri, DeLorme, NAVTEQ',
+  maxZoom:16
 }).addTo(map);
 
 // ----- 2. RESEAU (cache : ne sert qu'aux geometries de fond, non affiche) -----
