@@ -9,6 +9,7 @@ import networkx as nx
 import pandas as pd
 from shapely.geometry import LineString, Point, box
 from shapely.strtree import STRtree
+from shapely.affinity import translate
 import contextily as cx
 import math
 
@@ -23,6 +24,7 @@ from schema_reticulaire import (
     inserer_gare_sur_reseau,
     retirer_gare_sur_reseau,
     signes_offset_corridor,
+    offsets_faisceau_schematique,
 )
 
 # --- Palette de couleurs de mission, choisie à la main par l'utilisateur ---
@@ -492,14 +494,22 @@ def compute_schematic_layout(stations, segments, gd):
 
     return pos
 
-def oriented_offset(geom, off, canonical):
+def oriented_offset(geom, canonical, od_idx):
     """Décale la géométrie dans le référentiel de corridor (carte ET schéma).
 
-    `offset_curve` décale à gauche du sens coords[0]->coords[-1] (ordre
-    canonique des sid). `segment_sign` compense les inversions d'UIC et les
-    coudes pour que l'ordre d'empilement (indice de mission) reste le même
-    d'une gare à la suivante — y compris direct + omnibus sur le même
-    chemin."""
+    Mode carte : `offset_curve` (gauche du sens canonique UIC) × le signe
+    de corridor, pour que l'empilement ne s'inverse pas d'une gare à l'autre.
+
+    Mode schéma : translation monde calculée par `offsets_faisceau_schematique`
+    (rails colinéaires fusionnés, signe d'axe unifié). `offset_curve` sur
+    une arête UIC min→max schématique inverse l'ordre dès que deux missions
+    occupent le même axe sans partager la même paire de gares."""
+    if schema_mode:
+        ox, oy = schematic_shift.get((canonical, od_idx), (0.0, 0.0))
+        if ox == 0.0 and oy == 0.0:
+            return geom
+        return translate(geom, ox, oy)
+    off = segment_offsets.get((canonical, od_idx), 0.0)
     off = off * segment_sign.get(canonical, 1.0)
     return offset_line(geom, off)
 
@@ -599,22 +609,38 @@ meters_per_point = (view_w / ax.get_window_extent().width) * (fig.dpi / 72.0)
 #    empilées côte à côte, JOINTIVES, dans l'ordre croissant des indices
 #    (mission 1 toujours du même côté de la mission 2, etc.). Un casing blanc
 #    est dessiné sous le faisceau : visible sur le pourtour seulement.
-segment_offsets = {}   # (canonical, od_idx) -> offset en mètres
+segment_offsets = {}   # (canonical, od_idx) -> offset en mètres (mode carte)
 segment_width_m = {}   # canonical -> largeur totale du faisceau (mètres)
-for canonical, raw_users in segment_users.items():
-    users = sorted(raw_users)
-    widths_m = [freq_to_lw(st.session_state.ods[idx]['freq_tph']) * meters_per_point for idx in users]
-    total = sum(widths_m)
-    segment_width_m[canonical] = total
-    cursor = -total / 2.0
-    for idx, w in zip(users, widths_m):
-        segment_offsets[(canonical, idx)] = cursor + w / 2.0
-        cursor += w
+schematic_shift = {}   # (canonical, od_idx) -> (ox, oy) (mode schéma)
+segment_sign = {}
+liste_steps = [od['steps'] for od in st.session_state.ods]
+widths_by_od = {
+    od['idx']: freq_to_lw(od['freq_tph']) * meters_per_point
+    for od in st.session_state.ods
+}
 
-# 5bis. Sens d'offset par tronçon, propagé le long des corridors (carte +
-#    schéma) pour que l'ordre d'empilement ne s'inverse pas entre deux gares.
-segment_sign = signes_offset_corridor(
-    [od['steps'] for od in st.session_state.ods])
+if schema_mode:
+    schema_geoms = {
+        canonical: get_edge_geom(canonical[0], canonical[1])
+        for canonical in segment_users
+    }
+    schematic_shift, segment_width_m = offsets_faisceau_schematique(
+        schema_geoms, segment_users, liste_steps, pos, widths_by_od,
+        eps=SCHEMA_UNIT * 0.05,
+    )
+else:
+    for canonical, raw_users in segment_users.items():
+        users = sorted(raw_users)
+        widths_m = [widths_by_od[idx] for idx in users]
+        total = sum(widths_m)
+        segment_width_m[canonical] = total
+        cursor = -total / 2.0
+        for idx, w in zip(users, widths_m):
+            segment_offsets[(canonical, idx)] = cursor + w / 2.0
+            cursor += w
+    # Sens d'offset par tronçon, propagé le long des corridors pour que
+    # l'ordre d'empilement ne s'inverse pas entre deux gares.
+    segment_sign = signes_offset_corridor(liste_steps)
 
 def _line_parts(geom):
     """Itère les LineString d'une géométrie (offset_curve peut renvoyer un Multi)."""
@@ -635,8 +661,7 @@ for canonical_edge, raw_users in segment_users.items():
     geom = get_edge_geom(canonical_edge[0], canonical_edge[1])
     for od_idx in sorted(raw_users):
         od = st.session_state.ods[od_idx]
-        shifted_geom = oriented_offset(
-            geom, segment_offsets[(canonical_edge, od_idx)], canonical_edge)
+        shifted_geom = oriented_offset(geom, canonical_edge, od_idx)
         if shifted_geom.is_empty:
             continue
         lw = freq_to_lw(od['freq_tph'])
@@ -745,7 +770,7 @@ for od in st.session_state.ods:
         canonical = tuple(sorted((u, v)))
         shifted_geom = oriented_offset(
             get_edge_geom(canonical[0], canonical[1]),
-            segment_offsets[(canonical, od['idx'])], canonical)
+            canonical, od['idx'])
         lw = freq_to_lw(od['freq_tph'])
         for sid in (u, v):
             if sid in od['served_stations']:
@@ -964,7 +989,19 @@ for sid in to_label:
 #     Schéma est volontairement dé-cartographié, sans fond géographique).
 if not schema_mode:
     try:
-        cx.add_basemap(ax, crs=CRS_METRIC, source=cx.providers.CartoDB.Positron, alpha=0.5, zorder=0)
+        # Carto Positron exige désormais une clé API (tuiles « API KEY REQUIRED »).
+        # Esri WorldGrayCanvas offre un fond clair équivalent, sans clé ; repli OSM.
+        _basemap_ok = False
+        for _src in (cx.providers.Esri.WorldGrayCanvas,
+                     cx.providers.OpenStreetMap.Mapnik):
+            try:
+                cx.add_basemap(ax, crs=CRS_METRIC, source=_src, alpha=0.5, zorder=0)
+                _basemap_ok = True
+                break
+            except Exception:
+                continue
+        if not _basemap_ok:
+            raise RuntimeError("aucun fournisseur de tuiles n'a répondu")
     except Exception as e:
         st.warning("Impossible de charger le fond de carte géographique (accès internet requis pour les tuiles).")
 

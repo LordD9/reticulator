@@ -32,7 +32,7 @@ graph TD
 ```
 
 ### Fichiers du Projet :
-- **`schema_reticulaire.py`** : Backend SIG. Chargement, graphe, voisinages, recollage d'un trajet sur le réseau (`inserer_gare_sur_reseau`, `retirer_gare_sur_reseau`) et signes d'offset de corridor (`signes_offset_corridor`).
+- **`schema_reticulaire.py`** : Backend SIG. Chargement, graphe, voisinages, recollage d'un trajet sur le réseau (`inserer_gare_sur_reseau`, `retirer_gare_sur_reseau`), signes d'offset de corridor (`signes_offset_corridor`) et faisceaux schématiques colinéaires (`offsets_faisceau_schematique`).
 - **`app.py`** : Application Streamlit (référence). Missions, routage, rendu carte/schéma, export PNG.
 - **`gare.geojson`** : Points géographiques (WGS 84) de l'ensemble des gares d'intérêt.
 - **`reseau_ferroviaire.geojson`** : Lignes géographiques de l'infrastructure ferroviaire (MultiLineStrings).
@@ -60,7 +60,7 @@ L'écosystème comprend deux approches visuelles :
     *   S'appuie sur **Streamlit** pour l'interactivité (périmètre, 8 missions, gares desservies vs passage sans arrêt).
     *   Génère les cartes avec **Matplotlib** (mode carte OSM ou mode schéma orthogonal), export PNG carte + légende.
     *   **Style gares (plan type RATP)** : une mission → carré de la couleur de la mission ; plusieurs missions → carré blanc à contour noir. Le *type* de gare (A/B/C) ne colore plus le symbole : il pilote uniquement l'affichage du nom (a/b en mode carte, toutes en mode schéma, taille de police selon le type).
-    *   **Offset de corridor** : missions empilées jointives, ordre = indice de mission, signe d'offset propagé le long du chemin (`signes_offset_corridor`) pour que l'ordre ne s'inverse pas d'une gare à l'autre (direct + omnibus sur le même faisceau).
+    *   **Offset de corridor** : missions empilées jointives, ordre = indice de mission. Mode carte : `signes_offset_corridor` + `offset_curve`. Mode schéma : `offsets_faisceau_schematique` (rails colinéaires fusionnés, translation X/Y) pour éviter la superposition quand deux missions partagent un axe sans partager les mêmes gares.
     *   **Passage sans arrêt** : pas de symbole si aucune mission ne dessert la gare ; si d'autres s'y arrêtent, un extrait local de la ligne (sans casing blanc) est redessiné au-dessus du carré (`zorder=6`).
 2.  **Dashboard HTML (Legacy)** : Autonome (single-file HTML) basé sur **Leaflet.js** et `leaflet-polylineoffset`.
 
@@ -139,7 +139,9 @@ Le plugin Leaflet décale les lignes de manière latérale par rapport au sens d
 ### 3. Offset des missions (ordre constant le long d'un corridor)
 `offset_curve` décale à **gauche** du sens de dessin. Les géométries d'arêtes sont stockées dans le sens canonique `min(sid) → max(sid)`. Si on applique l'offset tel quel, l'ordre visuel s'inverse dès qu'un tronçon a des UIC dans l'ordre inverse du parcours : deux missions qui partagent le chemin (direct + omnibus, la direct ne desservant pas les gares intermédiaires) voient leurs traits **alterner** d'une gare à l'autre.
 
-*   *Solution actuelle* : `signes_offset_corridor(liste_steps)` propage un signe (+1 / -1) le long des tronçons consécutifs d'une même mission. L'empilement reste l'ordre des indices de mission ; le signe rend ce rang invariant du côté du faisceau, en mode carte **et** schéma. Ne pas recalculer le signe indépendamment par tronçon à partir de la seule mission « meneuse » locale (un changement de meneuse ou de sens inverse l'ordre).
+*   *Solution actuelle* :
+    *   **Mode carte** : `signes_offset_corridor(liste_steps)` propage un signe (+1 / -1) le long des tronçons consécutifs d'une même mission. L'empilement reste l'ordre des indices de mission ; le signe rend ce rang invariant du côté du faisceau. Ne pas recalculer le signe indépendamment par tronçon à partir de la seule mission « meneuse » locale.
+    *   **Mode schéma** : `offsets_faisceau_schematique` fusionne les tronçons *colinéaires et sécants* (même axe, même s'ils n'ont pas la même paire de gares — ex. Côte Bleue et ligne d'Aix qui descendent vers Marseille) puis translate en X/Y. `offset_curve` sur l'arête UIC min→max schématique superpose ces missions.
 
 Les couleurs d'un faisceau sont **jointives** (pas de liseré blanc entre missions). Un casing blanc n'est dessiné que sous le faisceau (`zorder=3`), donc visible sur le pourtour uniquement — un `path_effects` blanc + `capstyle='round'` par trait produisait un effet « boudin » aux gares non desservies.
 
