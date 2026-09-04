@@ -19,7 +19,6 @@ reticulaire_interactif.html
 *.jpeg
 
 # Documentation et configuration spécifiques aux Agents IA (LLM)
-AGENTS.md
 CLAUDE.md
 .agents/
 .claude/

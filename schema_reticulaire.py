@@ -10,6 +10,7 @@ Sortie : reticulaire_interactif.html
 
 import json
 import heapq
+from collections import defaultdict, deque
 from pathlib import Path
 
 import numpy as np
@@ -415,6 +416,139 @@ def voisinages_stricts(G):
         neighbors[src_sid] = nb_list
 
     return neighbors
+
+
+# ===================================================================
+# 3bis. RECOLLE SUR LE RÉSEAU (ajustement manuel d'une mission)
+# ===================================================================
+def plus_court_chemin(station_graph, src, tgt, exclus=None):
+    """Plus court chemin station-à-station, éventuellement en évitant des nœuds.
+
+    `exclus` sert à forcer un autre embranchement (ex. gare retirée par
+    l'utilisateur à une bifurcation). Les extrémités `src`/`tgt` ne sont
+    jamais exclues.
+    """
+    if src == tgt:
+        return [src]
+    if not station_graph.has_node(src) or not station_graph.has_node(tgt):
+        raise nx.NodeNotFound(f"{src} ou {tgt} absent du graphe")
+    graph = station_graph
+    if exclus:
+        interdits = {n for n in exclus if n not in (src, tgt)}
+        if interdits:
+            graph = station_graph.subgraph(n for n in station_graph if n not in interdits)
+    return nx.shortest_path(graph, source=src, target=tgt, weight="weight")
+
+
+def inserer_gare_sur_reseau(station_graph, steps, station, pos):
+    """Insère `station` à l'index `pos` et recolle les deux côtés sur le graphe.
+
+    Les gares intermédiaires du plus court chemin sont ajoutées pour que le
+    tracé suive le réseau existant (et non une ligne droite hors voies).
+
+    Renvoie `(nouveau_steps, ok_reseau)`. `ok_reseau` est False si l'un des
+    deux côtés n'est pas relié : on retombe alors sur une insertion brute.
+    """
+    pos = max(0, min(int(pos), len(steps)))
+    left = list(steps[:pos])
+    right = list(steps[pos:])
+    try:
+        if left:
+            new = left[:-1] + list(plus_court_chemin(station_graph, left[-1], station))
+        else:
+            new = [station]
+        if right:
+            new = new + list(plus_court_chemin(station_graph, station, right[0]))[1:]
+            new = new + right[1:]
+        return new, True
+    except (nx.NetworkXNoPath, nx.NodeNotFound):
+        return left + [station] + right, False
+
+
+def retirer_gare_sur_reseau(station_graph, steps, station):
+    """Retire `station` et recolle ses deux voisines sur le graphe.
+
+    La gare retirée est exclue du plus court chemin pour ne pas la réintroduire
+    (cas d'une bifurcation où l'itinéraire par défaut n'était pas le bon).
+
+    Renvoie `(nouveau_steps, ok_reseau)`. Si aucun itinéraire alternatif
+    n'existe, les deux voisines sont simplement jointes (tronçon hors graphe).
+    """
+    if station not in steps:
+        return list(steps), True
+    idx = steps.index(station)
+    left = list(steps[:idx])
+    right = list(steps[idx + 1:])
+    if not left:
+        return right, True
+    if not right:
+        return left, True
+    prev, nxt = left[-1], right[0]
+    try:
+        fill = list(plus_court_chemin(station_graph, prev, nxt, exclus={station}))
+        return left[:-1] + fill + right[1:], True
+    except (nx.NetworkXNoPath, nx.NodeNotFound):
+        return left + right, False
+
+
+def signes_offset_corridor(liste_steps):
+    """Signe d'offset (+1 / -1) par tronçon, propagé le long des corridors.
+
+    `offset_curve` décale à gauche du sens géométrique canonique
+    (sid min → sid max). Sans compensation, l'ordre visuel des missions
+    s'inverse dès qu'un tronçon a des UIC dans l'ordre inverse du parcours
+    (cas typique : direct + omnibus, traits qui alternent d'une gare à
+    l'autre).
+
+    On propage un référentiel le long des tronçons *consécutifs* d'une même
+    mission : le rang (indice de mission, ordre d'empilement) reste du même
+    côté du faisceau d'un bout à l'autre, y compris aux coudes, quand une
+    mission ne dessert pas les gares intermédiaires, et en mode carte comme
+    en mode schéma.
+
+    `liste_steps[i]` = séquence de gares de la mission d'indice i.
+    Renvoie `{ (sid_min, sid_max): +1.0 | -1.0 }`.
+    """
+    travel = {}          # (canonical, idx) -> +1.0 si parcours = geom canonique
+    adj = defaultdict(list)  # canonical -> [(voisin, idx_mission), ...]
+    users = {}           # canonical -> set d'indices
+
+    for idx, steps in enumerate(liste_steps):
+        if not steps or len(steps) < 2:
+            continue
+        edges = []
+        for a, b in zip(steps, steps[1:]):
+            canonical = tuple(sorted((a, b)))
+            travel[(canonical, idx)] = 1.0 if (a, b) == canonical else -1.0
+            users.setdefault(canonical, set()).add(idx)
+            edges.append(canonical)
+        for e1, e2 in zip(edges, edges[1:]):
+            if e1 != e2:
+                adj[e1].append((e2, idx))
+                adj[e2].append((e1, idx))
+
+    signs = {}
+    remaining = set(users)
+    while remaining:
+        seed = min(remaining)  # déterministe
+        lead = min(users[seed])
+        signs[seed] = travel.get((seed, lead), 1.0)
+        remaining.remove(seed)
+        q = deque([seed])
+        while q:
+            e = q.popleft()
+            for e2, mid in adj.get(e, []):
+                if e2 in signs or e2 not in users:
+                    continue
+                t1 = travel.get((e, mid), 0.0)
+                t2 = travel.get((e2, mid), 0.0)
+                if t1 == 0.0 or t2 == 0.0:
+                    continue
+                # Conserve le côté de `mid` : sign * travel est invariant.
+                signs[e2] = signs[e] * t1 * t2
+                remaining.discard(e2)
+                q.append(e2)
+    return signs
 
 
 # ===================================================================
