@@ -3,12 +3,12 @@ from collections import deque
 import streamlit as st
 import streamlit.components.v1 as components
 import matplotlib.pyplot as plt
-import matplotlib.patheffects as pe
 from matplotlib.patches import Polygon, Patch
 from matplotlib.lines import Line2D
 import networkx as nx
 import pandas as pd
-from shapely.geometry import LineString, Point
+from shapely.geometry import LineString, Point, box
+from shapely.strtree import STRtree
 import contextily as cx
 import math
 
@@ -19,13 +19,13 @@ from schema_reticulaire import (
     voisinages_stricts,
     noms_regions,
     PALETTE_OD,
-    COLORS_TYPE_GARE,
-    CRS_METRIC
+    CRS_METRIC,
+    inserer_gare_sur_reseau,
+    retirer_gare_sur_reseau,
+    signes_offset_corridor,
 )
 
 # --- Palette de couleurs de mission, choisie à la main par l'utilisateur ---
-# Exclut volontairement les teintes des types de gare (rouge type A, bleu type B,
-# vert type C, gris défaut) afin de préserver la lisibilité des marqueurs de gare.
 MISSION_PALETTE = {
     "Bleu ardoise": "#4E79A7",
     "Orange": "#F28E2B",
@@ -40,28 +40,6 @@ MISSION_PALETTE = {
     "Magenta": "#C0399F",
     "Anthracite": "#3D3D5C",
 }
-
-# Couleurs réservées aux gares (interdites pour les missions, comparaison RGB).
-_RESERVED_GARE_COLORS = [v for v in COLORS_TYPE_GARE.values()]
-
-
-def _hex_to_rgb(h):
-    h = h.lstrip('#')
-    return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
-
-
-def color_conflicts_with_gares(hex_color, seuil=60):
-    """Renvoie la couleur de gare en conflit si la teinte choisie est trop
-    proche (distance euclidienne RGB) d'une couleur réservée aux gares."""
-    try:
-        r, g, b = _hex_to_rgb(hex_color)
-    except Exception:
-        return None
-    for res in _RESERVED_GARE_COLORS:
-        rr, rg, rb = _hex_to_rgb(res)
-        if math.sqrt((r - rr) ** 2 + (g - rg) ** 2 + (b - rb) ** 2) < seuil:
-            return res
-    return None
 
 st.set_page_config(page_title="Reticulator - Générateur Interactif", layout="wide")
 
@@ -174,9 +152,16 @@ def offset_line(geom, offset):
         side = 'left' if offset > 0 else 'right'
         return geom.parallel_offset(abs(offset), side)
 
+# Messages d'édition de trajet : affichés hors des expanders (repliés par défaut).
+for _i in range(len(st.session_state.ods)):
+    flash = st.session_state.pop(f"route_msg_{_i}", None)
+    if flash:
+        kind, text = flash
+        getattr(st.sidebar, kind)(f"Mission {_i + 1} : {text}")
+
 for i, od in enumerate(st.session_state.ods):
     with st.sidebar.expander(f"Mission {i+1} - {format_station(od['depart'])} ➔ {format_station(od['arrivee'])}", expanded=False):
-        # --- Choix manuel de la couleur dans une palette (hors couleurs de gare) ---
+        # --- Choix manuel de la couleur dans une palette ---
         palette_names = list(MISSION_PALETTE.keys())
         # Détermine la sélection courante : un nom de palette, sinon "Personnalisé…"
         current_name = next((n for n, h in MISSION_PALETTE.items()
@@ -188,15 +173,8 @@ for i, od in enumerate(st.session_state.ods):
             key=f"palette_{i}",
         )
         if choix == "Personnalisé…":
-            custom = st.color_picker("Teinte personnalisée", value=od['color'], key=f"color_{i}")
-            conflit = color_conflicts_with_gares(custom)
-            if conflit:
-                st.warning(
-                    f"Cette teinte est trop proche d'une couleur réservée aux gares "
-                    f"({conflit}). Choisissez-en une autre pour garder les gares lisibles."
-                )
-            else:
-                od['color'] = custom
+            od['color'] = st.color_picker(
+                "Teinte personnalisée", value=od['color'], key=f"color_{i}")
         else:
             od['color'] = MISSION_PALETTE[choix]
         st.markdown(
@@ -247,21 +225,27 @@ for i, od in enumerate(st.session_state.ods):
                 st.rerun()
 
             # Sélection des gares spécifiquement desservies
+            # La clé dépend du trajet : après insertion/retrait (recolle réseau)
+            # Streamlit ignore `default` si le widget existe déjà.
+            _sk = "|".join(od['steps'])
             served = st.multiselect(
                 "Gares desservies (décocher = passage sans arrêt)",
                 options=od['steps'],
-                default=od['served_stations'],
+                default=[s for s in od['served_stations'] if s in od['steps']],
                 format_func=format_station,
-                key=f"served_{i}"
+                key=f"served_{i}_{_sk}"
             )
             od['served_stations'] = served
 
         # --- Ajustement manuel du trajet (toujours disponible) ---
-        # Le routage automatique (surtout en périmètre national) peut manquer une
-        # gare pourtant située sur le parcours, voire échouer si une gare est
-        # isolée : on peut alors insérer les gares à la main (y compris pour bâtir
-        # un trajet de zéro) ou en retirer une.
+        # Le plus court chemin peut emprunter le mauvais embranchement : on
+        # insère/retire des gares, et chaque édition recolle le trajet sur le
+        # graphe (gares intermédiaires du réseau, géométrie des voies).
         st.markdown("**✏️ Ajustement manuel du trajet**")
+        st.caption(
+            "À une bifurcation, retirez les gares du mauvais embranchement et "
+            "insérez celles du bon : le tracé est recollé sur le réseau existant."
+        )
         if od['steps']:
             st.caption("Ordre actuel : " +
                        " → ".join(format_station(s) for s in od['steps']))
@@ -292,11 +276,34 @@ for i, od in enumerate(st.session_state.ods):
             elif add_g in od['steps']:
                 st.warning("Cette gare est déjà présente dans le trajet.")
             else:
-                od['steps'].insert(ins_pos, add_g)
-                if add_g not in od['served_stations']:
-                    od['served_stations'].append(add_g)
-                od['depart'] = od['steps'][0]
-                od['arrivee'] = od['steps'][-1]
+                old_steps = list(od['steps'])
+                new_steps, ok = inserer_gare_sur_reseau(
+                    station_graph, od['steps'], add_g, ins_pos)
+                od['steps'] = new_steps
+                # Conserver le statut « desservie » des gares qui restent ;
+                # les gares nouvellement injectées par le graphe sont desservies
+                # par défaut (l'utilisateur peut les décocher).
+                kept = [s for s in od['served_stations'] if s in new_steps]
+                added = [s for s in new_steps if s not in old_steps]
+                od['served_stations'] = kept + [s for s in added if s not in kept]
+                if od['steps']:
+                    od['depart'] = od['steps'][0]
+                    od['arrivee'] = od['steps'][-1]
+                if ok:
+                    n_add = len(added)
+                    extra = (f" {n_add} gare(s) du réseau ajoutée(s) sur le trajet."
+                             if n_add > 1 else "")
+                    st.session_state[f"route_msg_{i}"] = (
+                        "success",
+                        "Gare insérée, tracé recollé sur le réseau." + extra,
+                    )
+                else:
+                    st.session_state[f"route_msg_{i}"] = (
+                        "warning",
+                        "Gare insérée, mais aucun itinéraire réseau n'a été trouvé "
+                        "de part et d'autre : le tronçon est tracé en ligne droite. "
+                        "Insérez une gare intermédiaire pour recoller aux voies.",
+                    )
                 st.rerun()
 
         if od['steps']:
@@ -305,14 +312,32 @@ for i, od in enumerate(st.session_state.ods):
                 format_func=format_station, index=0, key=f"remg_{i}")
             if st.button("➖ Retirer la gare", key=f"rembtn_{i}", use_container_width=True):
                 if rem_g:
-                    od['steps'] = [s for s in od['steps'] if s != rem_g]
-                    od['served_stations'] = [s for s in od['served_stations'] if s != rem_g]
+                    old_steps = list(od['steps'])
+                    new_steps, ok = retirer_gare_sur_reseau(
+                        station_graph, od['steps'], rem_g)
+                    od['steps'] = new_steps
+                    kept = [s for s in od['served_stations'] if s in new_steps]
+                    added = [s for s in new_steps if s not in old_steps]
+                    od['served_stations'] = kept + [s for s in added if s not in kept]
                     if od['steps']:
                         od['depart'] = od['steps'][0]
                         od['arrivee'] = od['steps'][-1]
                     else:
                         od['depart'] = None
                         od['arrivee'] = None
+                    if ok:
+                        st.session_state[f"route_msg_{i}"] = (
+                            "success",
+                            "Gare retirée, tracé recollé sur le réseau "
+                            "(l'embranchement retiré n'est pas réintroduit).",
+                        )
+                    else:
+                        st.session_state[f"route_msg_{i}"] = (
+                            "warning",
+                            "Gare retirée, mais aucun itinéraire réseau alternatif "
+                            "n'a été trouvé : le tronçon restant est en ligne droite. "
+                            "Insérez la gare du bon embranchement pour recoller.",
+                        )
                     st.rerun()
 
 # --- MODE D'AFFICHAGE ---
@@ -337,7 +362,16 @@ st.sidebar.caption(
 
 # --- GENERATION DE LA CARTE ---
 st.title("Générateur de Schéma Réticulaire")
-st.markdown("Ce tableau de bord permet de calculer et superposer jusqu'à 8 relations ferroviaires. Les traits se décalent automatiquement s'ils partagent les mêmes voies (Offset), et la hiérarchie visuelle reflète la desserte : **si une gare est décochée (passage sans arrêt), la ligne passe au-dessus du point de la gare**. L'épaisseur des traits est proportionnelle à la fréquence, et lorsque plusieurs missions empruntent les mêmes voies, leurs traits sont empilés côte à côte (jointifs, dans un ordre constant) sans jamais se superposer, quelle que soit l'échelle.")
+st.markdown(
+    "Ce tableau de bord permet de calculer et superposer jusqu'à 8 relations "
+    "ferroviaires. Les traits se décalent automatiquement s'ils partagent les "
+    "mêmes voies (offset). **Une gare desservie par une seule mission prend la "
+    "couleur de cette mission ; une correspondance (plusieurs missions) est un "
+    "carré blanc à contour noir.** Si une gare est décochée (passage sans arrêt), "
+    "la ligne passe au-dessus du symbole. L'épaisseur des traits est "
+    "proportionnelle à la fréquence ; sur un même faisceau les couleurs sont "
+    "jointives, dans un ordre constant."
+)
 if schema_mode:
     st.info("📐 **Mode Schéma actif** : rendu simplifié à angles droits, gares alignées et espacement régularisé, toutes les gares nommées. L'export reprend cette version.")
 
@@ -459,20 +493,14 @@ def compute_schematic_layout(stations, segments, gd):
     return pos
 
 def oriented_offset(geom, off, canonical):
-    """Décale la géométrie en gardant les traits empilés du même côté relatif au
-    SENS DE PARCOURS de la ligne (mode Schéma uniquement).
+    """Décale la géométrie dans le référentiel de corridor (carte ET schéma).
 
-    `offset_curve` décale à gauche du sens coords[0]->coords[-1], c.-à-d. de
-    l'ordre canonique des sid — indépendant du sens réel de parcours des missions.
-    Résultat : à un changement de direction (coude) ou à une gare où l'ordre des
-    sid s'inverse, une mission bascule de gauche à droite et les traits se
-    croisent. On rétablit donc, pour chaque tronçon, une orientation alignée sur
-    le sens de parcours de la mission « meneuse » (plus petit indice) qui
-    l'emprunte : les bandes tournent les coudes de façon concentrique, sans
-    croisement, et gardent un ordre constant sur tout le tracé. En mode carte, la
-    géométrie réelle est conservée telle quelle (pas de réorientation)."""
-    if schema_mode:
-        off = off * segment_sign.get(canonical, 1.0)
+    `offset_curve` décale à gauche du sens coords[0]->coords[-1] (ordre
+    canonique des sid). `segment_sign` compense les inversions d'UIC et les
+    coudes pour que l'ordre d'empilement (indice de mission) reste le même
+    d'une gare à la suivante — y compris direct + omnibus sur le même
+    chemin."""
+    off = off * segment_sign.get(canonical, 1.0)
     return offset_line(geom, off)
 
 
@@ -483,26 +511,27 @@ ax.axis('off')
 # Épaisseur du trait proportionnelle à la fréquence (en points), avec un
 # minimum lisible. Utilisée partout (tracé, passages, légende) pour rester cohérent.
 LW_PER_TPH = 2.0
-# Liseré blanc (en points) ajouté de chaque côté de chaque trait de mission
-# pour séparer visuellement les missions empilées côte à côte. Volontairement
-# fin : une simple séparation de lisibilité, pas une bande large.
-LISERE_PT = 0.5
+# Casing extérieur du faisceau (en points), dessiné SOUS les couleurs. Les
+# couleurs elles-mêmes sont jointives (pas de liseré blanc entre missions) :
+# le blanc n'apparaît que sur le pourtour du faisceau, plus sur les joints.
+CASING_PT = 0.9
 
 def freq_to_lw(freq):
     return max(1.2, freq * LW_PER_TPH)
 
-def white_outline(lw):
-    """Effet de tracé : liseré blanc fin sous la couleur de la mission."""
-    return [pe.Stroke(linewidth=lw + 2 * LISERE_PT, foreground='white'), pe.Normal()]
-
-# 1. Identifier les tronçons partagés (ordre constant = tri par id de mission)
+# 1. Identifier les tronçons partagés. L'ordre d'empilement est l'indice de
+#    mission (tri croissant) : il doit rester identique d'un tronçon au
+#    suivant (direct + omnibus, même chemin, desserte différente).
 segment_users = {}
 for od in st.session_state.ods:
-    if len(od['steps']) < 2: continue
-    for i in range(len(od['steps'])-1):
-        u = od['steps'][i]
-        v = od['steps'][i+1]
-        canonical = tuple(sorted((u, v)))
+    if len(od['steps']) < 2:
+        continue
+    seen_edges = set()
+    for i in range(len(od['steps']) - 1):
+        canonical = tuple(sorted((od['steps'][i], od['steps'][i + 1])))
+        if canonical in seen_edges:
+            continue
+        seen_edges.add(canonical)
         segment_users.setdefault(canonical, []).append(od['idx'])
 
 # 2. Gares dessinées + positions (géographiques ou schématiques selon le mode).
@@ -543,8 +572,8 @@ minx, maxx = min(all_xs), max(all_xs)
 miny, maxy = min(all_ys), max(all_ys)
 # Marges plus larges en mode Schéma : toutes les gares sont nommées, il faut de
 # la place autour du dessin pour poser les étiquettes sans les tronquer.
-mfac = 0.12 if schema_mode else 0.06
-madd = SCHEMA_UNIT * 0.7 if schema_mode else 5000
+mfac = 0.14 if schema_mode else 0.08
+madd = SCHEMA_UNIT * 0.9 if schema_mode else 7000
 margin_x = (maxx - minx) * mfac + madd
 margin_y = (maxy - miny) * mfac + madd
 bx0, bx1 = minx - margin_x, maxx + margin_x
@@ -565,85 +594,86 @@ fig.canvas.draw()
 view_w = x1 - x0
 view_h = y1 - y0
 meters_per_point = (view_w / ax.get_window_extent().width) * (fig.dpi / 72.0)
-gap_m = 2 * LISERE_PT * meters_per_point  # espace réservé au liseré blanc entre traits
 
 # 5. Pré-calcul des offsets : sur chaque tronçon partagé, les missions sont
-#    empilées côte à côte dans un ordre constant, avec un fin liseré blanc entre
-#    elles. Le décalage de chaque trait dérive de sa propre épaisseur + liseré ->
-#    elles restent dans le même ordre quelle que soit l'échelle, sans se superposer.
+#    empilées côte à côte, JOINTIVES, dans l'ordre croissant des indices
+#    (mission 1 toujours du même côté de la mission 2, etc.). Un casing blanc
+#    est dessiné sous le faisceau : visible sur le pourtour seulement.
 segment_offsets = {}   # (canonical, od_idx) -> offset en mètres
 segment_width_m = {}   # canonical -> largeur totale du faisceau (mètres)
 for canonical, raw_users in segment_users.items():
     users = sorted(raw_users)
     widths_m = [freq_to_lw(st.session_state.ods[idx]['freq_tph']) * meters_per_point for idx in users]
-    # largeur visuelle du faisceau = traits + liserés internes + liserés externes
-    total = sum(widths_m) + gap_m * max(0, len(users) - 1) + 2 * LISERE_PT * meters_per_point
+    total = sum(widths_m)
     segment_width_m[canonical] = total
     cursor = -total / 2.0
     for idx, w in zip(users, widths_m):
         segment_offsets[(canonical, idx)] = cursor + w / 2.0
-        cursor += w + gap_m
+        cursor += w
 
-# 5bis. Sens de décalage par tronçon (mode Schéma) : aligné sur le sens de
-#    parcours de la mission meneuse (plus petit indice) empruntant le tronçon.
-#    La géométrie schématique est tracée dans l'ordre canonique des sid
-#    (canonical[0] -> canonical[1]) ; si la meneuse le parcourt dans l'autre sens,
-#    on inverse le signe pour que la bande reste du même côté relatif au parcours
-#    -> pas de croisement aux coudes / aux inversions d'ordre de sid.
-segment_sign = {}   # canonical -> +1.0 / -1.0
-for canonical, raw_users in segment_users.items():
-    a, b = canonical                      # a < b, sens canonique de la géométrie
-    lead_steps = st.session_state.ods[min(raw_users)]['steps']
-    sgn = 1.0
-    for i in range(len(lead_steps) - 1):
-        pair = (lead_steps[i], lead_steps[i + 1])
-        if pair == (a, b):
-            sgn = 1.0
-            break
-        if pair == (b, a):                # meneuse à contre-sens du sens canonique
-            sgn = -1.0
-            break
-    segment_sign[canonical] = sgn
+# 5bis. Sens d'offset par tronçon, propagé le long des corridors (carte +
+#    schéma) pour que l'ordre d'empilement ne s'inverse pas entre deux gares.
+segment_sign = signes_offset_corridor(
+    [od['steps'] for od in st.session_state.ods])
 
-# 6. Lignes de mission (Z-order: 4) avec liseré blanc
+def _line_parts(geom):
+    """Itère les LineString d'une géométrie (offset_curve peut renvoyer un Multi)."""
+    if geom is None or geom.is_empty:
+        return
+    if geom.geom_type == 'LineString':
+        yield geom
+        return
+    for g in getattr(geom, 'geoms', []):
+        if g.geom_type == 'LineString' and not g.is_empty:
+            yield g
+
+
+# 6. Lignes de mission : casing blanc sous le faisceau (z=3), couleurs jointives
+#    (z=4), sans path_effects. Le blanc ne reste visible que sur le pourtour.
+painted_lines = []  # (LineString, largeur_m) pour l'anti-collision des étiquettes
 for canonical_edge, raw_users in segment_users.items():
     geom = get_edge_geom(canonical_edge[0], canonical_edge[1])
     for od_idx in sorted(raw_users):
         od = st.session_state.ods[od_idx]
-        shifted_geom = oriented_offset(geom, segment_offsets[(canonical_edge, od_idx)], canonical_edge)
+        shifted_geom = oriented_offset(
+            geom, segment_offsets[(canonical_edge, od_idx)], canonical_edge)
         if shifted_geom.is_empty:
             continue
         lw = freq_to_lw(od['freq_tph'])
-        parts = [shifted_geom] if shifted_geom.geom_type == 'LineString' else list(shifted_geom.geoms)
-        for ls in parts:
+        join = 'miter' if schema_mode else 'round'
+        for ls in _line_parts(shifted_geom):
             xs, ys = ls.xy
+            # Casing en caps plats : un casing rond créerait un bulbe blanc
+            # à chaque jointure de tronçon (l'ancien effet « boudin »).
+            ax.plot(xs, ys, color='white', linewidth=lw + 2 * CASING_PT, zorder=3,
+                    solid_capstyle='butt', solid_joinstyle=join)
             ax.plot(xs, ys, color=od['color'], linewidth=lw, zorder=4,
-                    solid_capstyle='round', path_effects=white_outline(lw))
+                    solid_capstyle='round', solid_joinstyle=join)
+            painted_lines.append((ls, lw * meters_per_point))
 
-# 7. Gares : rectangles PERPENDICULAIRES au faisceau de missions (Z-order: 5).
-#    - Bord noir (type a/b) ou gris (c/défaut), fond = couleur du type.
-#    - Le rectangle couvre les missions qui s'ARRÊTENT (trait masqué dessous).
-#    - Les missions sans arrêt seront redessinées par-dessus (étape 8) -> elles
-#      traversent visiblement le rectangle.
-#    Le grand côté du rectangle est orienté perpendiculairement aux traits de
-#    mission et sa longueur vaut la largeur cumulée de TOUTES les missions passant
-#    par la gare (le faisceau incident le plus large) : le rectangle traverse ainsi
-#    exactement l'ensemble des traits empilés, desservis ou non.
+# 7. Gares (Z-order: 5) — style inspiré du plan de métro RATP :
+#    - desservie par UNE mission : carré de la couleur de la mission ;
+#    - desservie par PLUSIEURS missions : carré blanc, contour noir ;
+#    - passage sans arrêt uniquement : pas de symbole (la ligne traverse).
+#    Le carré est orienté sur le faisceau et dimensionné pour le couvrir.
 incident_segments = {}   # sid -> [canonical, ...] segments touchant la gare
 station_bundle = {}      # sid -> largeur du faisceau le plus large (mètres)
-station_missions = {}    # sid -> set des missions touchant la gare
+station_served_by = {}   # sid -> [od_idx, ...] missions qui DESSERVENT la gare
 for canonical in segment_users:
     for sid in canonical:
         incident_segments.setdefault(sid, []).append(canonical)
         station_bundle[sid] = max(station_bundle.get(sid, 0.0), segment_width_m[canonical])
 for od in st.session_state.ods:
-    for sid in set(od['steps']):
-        station_missions.setdefault(sid, set()).add(od['idx'])
+    if len(od['steps']) < 2:
+        continue
+    for sid in od['served_stations']:
+        if sid in drawn_stations:
+            station_served_by.setdefault(sid, []).append(od['idx'])
 
 
 def station_axis(sid):
     """Direction unitaire (dx, dy) du faisceau de missions le plus large incident
-    à la gare, servant à orienter le rectangle perpendiculairement aux traits.
+    à la gare, servant à orienter le carré sur les traits.
     Renvoie (1, 0) par défaut si aucune direction exploitable."""
     px, py = pos[sid]
     best_w, best_dir = -1.0, (1.0, 0.0)
@@ -669,65 +699,74 @@ def station_axis(sid):
     return best_dir
 
 
-min_len = meters_per_point * 9      # longueur minimale (petites gares mono-mission)
-bar_thick = meters_per_point * 7    # épaisseur (petit côté) du rectangle de gare
+min_sq = meters_per_point * 8       # côté mini d'un carré de gare
 station_rects = {}  # sid -> (rx0, ry0, rx1, ry1) bbox englobante (anti-collision)
 for sid in drawn_stations:
-    info = gares_dict[sid]
     x, y = pos[sid]
-    color = COLORS_TYPE_GARE.get(info['type'], COLORS_TYPE_GARE['default'])
-    edge = '#000000' if info['type'] in ('a', 'b') else '#555555'
-    # Longueur = largeur cumulée du faisceau (missions empilées + liserés).
-    length = max(min_len, station_bundle.get(sid, 0.0))
-    dx, dy = station_axis(sid)          # direction des traits (grand axe du faisceau)
-    nx_, ny_ = -dy, dx                  # normale : axe le long duquel s'empilent les missions
-    hl = length / 2.0                   # demi-longueur (le long de la normale)
-    ht = bar_thick / 2.0                # demi-épaisseur (le long des traits)
-    corners = [
-        (x + ht * dx + hl * nx_, y + ht * dy + hl * ny_),
-        (x + ht * dx - hl * nx_, y + ht * dy - hl * ny_),
-        (x - ht * dx - hl * nx_, y - ht * dy - hl * ny_),
-        (x - ht * dx + hl * nx_, y - ht * dy + hl * ny_),
-    ]
-    poly = Polygon(corners, closed=True, facecolor=color, edgecolor=edge,
-                   linewidth=1.2, zorder=5, joinstyle='round')
-    poly.set_clip_on(True)
-    ax.add_patch(poly)
-    xs_c = [c[0] for c in corners]
-    ys_c = [c[1] for c in corners]
-    station_rects[sid] = (min(xs_c), min(ys_c), max(xs_c), max(ys_c))
+    served = station_served_by.get(sid, [])
+    dx, dy = station_axis(sid)
+    nx_, ny_ = -dy, dx
+    if served:
+        # Carré un peu plus large que le faisceau pour que le contour reste visible.
+        side = max(min_sq, station_bundle.get(sid, 0.0) + meters_per_point * 2.5)
+        if len(served) == 1:
+            face, edge, elw = st.session_state.ods[served[0]]['color'], '#111111', 1.1
+        else:
+            face, edge, elw = '#FFFFFF', '#111111', 1.7
+        hs = side / 2.0
+        corners = [
+            (x + hs * dx + hs * nx_, y + hs * dy + hs * ny_),
+            (x + hs * dx - hs * nx_, y + hs * dy - hs * ny_),
+            (x - hs * dx - hs * nx_, y - hs * dy - hs * ny_),
+            (x - hs * dx + hs * nx_, y - hs * dy + hs * ny_),
+        ]
+        poly = Polygon(corners, closed=True, facecolor=face, edgecolor=edge,
+                       linewidth=elw, zorder=5, joinstyle='miter')
+        poly.set_clip_on(True)
+        ax.add_patch(poly)
+        xs_c = [c[0] for c in corners]
+        ys_c = [c[1] for c in corners]
+        station_rects[sid] = (min(xs_c), min(ys_c), max(xs_c), max(ys_c))
+    else:
+        # Passage sans arrêt : pas de symbole, juste une emprise pour les labels.
+        pad = meters_per_point * 4
+        station_rects[sid] = (x - pad, y - pad, x + pad, y + pad)
 
-# 8. Gares non-desservies (passage sans arrêt) : on redessine un extrait local
-#    de la ligne (mêmes offsets) PAR-DESSUS le rectangle (Z-order: 6) -> le trait
-#    traverse visiblement le rectangle.
-catch_radius = max(1500, view_w * 0.012)
+# 8. Passage sans arrêt AU-DESSUS d'une gare desservie par d'autres missions :
+#    on redessine un extrait LOCAL (rayon = côté du carré, pas un km) par-dessus
+#    le symbole, SANS casing blanc — c'est ce casing + un rayon trop large qui
+#    produisait l'effet « boudin ».
 for od in st.session_state.ods:
-    if len(od['steps']) < 2: continue
-    for i in range(len(od['steps'])-1):
+    if len(od['steps']) < 2:
+        continue
+    for i in range(len(od['steps']) - 1):
         u = od['steps'][i]
-        v = od['steps'][i+1]
+        v = od['steps'][i + 1]
         canonical = tuple(sorted((u, v)))
-        shifted_geom = oriented_offset(get_edge_geom(canonical[0], canonical[1]),
-                                       segment_offsets[(canonical, od['idx'])], canonical)
+        shifted_geom = oriented_offset(
+            get_edge_geom(canonical[0], canonical[1]),
+            segment_offsets[(canonical, od['idx'])], canonical)
         lw = freq_to_lw(od['freq_tph'])
         for sid in (u, v):
-            if sid not in od['served_stations']:
-                station_pt = Point(*pos[sid])
-                local_seg = shifted_geom.intersection(station_pt.buffer(catch_radius))
-                if local_seg.is_empty:
-                    continue
-                parts = [local_seg] if local_seg.geom_type == 'LineString' else list(getattr(local_seg, 'geoms', []))
-                for ls in parts:
-                    if ls.geom_type != 'LineString' or ls.is_empty:
-                        continue
-                    xs, ys = ls.xy
-                    ax.plot(xs, ys, color=od['color'], linewidth=lw, zorder=6,
-                            solid_capstyle='round', path_effects=white_outline(lw))
+            if sid in od['served_stations']:
+                continue
+            if sid not in station_served_by:
+                continue  # personne ne s'arrête : pas de symbole à recouvrir
+            rx0, ry0, rx1, ry1 = station_rects[sid]
+            catch_radius = 0.55 * max(rx1 - rx0, ry1 - ry0)
+            station_pt = Point(*pos[sid])
+            local_seg = shifted_geom.intersection(station_pt.buffer(catch_radius))
+            if local_seg.is_empty:
+                continue
+            for ls in _line_parts(local_seg):
+                xs, ys = ls.xy
+                ax.plot(xs, ys, color=od['color'], linewidth=lw, zorder=6,
+                        solid_capstyle='butt', solid_joinstyle='miter')
 
-# 9. Étiquettes de gares avec anti-collision et trait de rappel.
+# 9. Étiquettes de gares avec anti-collision (gares + tracés) et trait de rappel.
 #    - Mode carte : seules les gares de type a/b sont nommées (lisibilité du fond).
-#    - Mode Schéma : TOUTES les gares sont nommées, avec une taille de police
-#      croissante selon le type (a > b > c > autre).
+#    - Mode Schéma : TOUTES les gares sont nommées, taille de police selon le type
+#      (a > b > c > autre). Les couleurs de gare ne dépendent plus du type.
 def _overlap(a, b):
     return not (a[2] <= b[0] or a[0] >= b[2] or a[3] <= b[1] or a[1] >= b[3])
 
@@ -741,14 +780,54 @@ def _overlap_area(a, b):
         return 0.0
     return dx * dy
 
+
+def _unit(vx, vy):
+    n = math.hypot(vx, vy)
+    if n < 1e-9:
+        return (1.0, 0.0)
+    return (vx / n, vy / n)
+
+
+def _exit_dist(hw, hh, ux, uy):
+    """Distance du centre au bord d'une AABB le long du vecteur unitaire (ux, uy)."""
+    tx = hw / abs(ux) if abs(ux) > 1e-9 else float('inf')
+    ty = hh / abs(uy) if abs(uy) > 1e-9 else float('inf')
+    d = min(tx, ty)
+    return d if math.isfinite(d) else hw
+
+
+# Tampons des tracés : une étiquette ne doit pas recouvrir le faisceau.
+line_buffers = []
+pad_line = meters_per_point * 2.0
+for g, w_m in painted_lines:
+    try:
+        buf = g.buffer(w_m / 2.0 + pad_line)
+        if buf is not None and not buf.is_empty:
+            line_buffers.append(buf)
+    except Exception:
+        continue
+line_tree = STRtree(line_buffers) if line_buffers else None
+
+
+def _hits_lines(bbox):
+    if line_tree is None:
+        return False
+    poly = box(bbox[0], bbox[1], bbox[2], bbox[3])
+    cand = line_tree.query(poly)
+    for i in cand:
+        if poly.intersects(line_buffers[int(i)]):
+            return True
+    return False
+
+
 # Limites internes : on garde une petite marge pour rester dans le cadre.
 bound_m = meters_per_point * 2
 lim = (x0 + bound_m, y0 + bound_m, x1 - bound_m, y1 - bound_m)
 
-# bboxes déjà occupées : tous les rectangles de gare.
+# bboxes déjà occupées : emprises des gares (carrés ou points de passage).
 occupied = list(station_rects.values())
 
-# Taille de police par type de gare (mode Schéma).
+# Taille de police par type de gare (inchangé : le type pilote le nom, pas la couleur).
 FONT_BY_TYPE = {'a': 11, 'b': 9, 'c': 8, 'default': 7}
 type_rank = {'a': 0, 'b': 1, 'c': 2}
 
@@ -761,9 +840,31 @@ else:
     to_label = [sid for sid in drawn_stations if gares_dict[sid]['type'] in ('a', 'b')]
     to_label.sort(key=lambda s: 0 if gares_dict[s]['type'] == 'a' else 1)
 
-gap_lbl = meters_per_point * 4
-# directions candidates (dx, dy) : droite, gauche, haut, bas, puis diagonales.
-DIRECTIONS = [(1, 0), (-1, 0), (0, 1), (0, -1), (1, 1), (-1, 1), (1, -1), (-1, -1)]
+gap_lbl = meters_per_point * 5
+cx_map = (minx + maxx) / 2.0
+cy_map = (miny + maxy) / 2.0
+
+
+def _label_dirs(sid, x, y):
+    """Directions candidates : d'abord perpendiculaire au tracé (côté extérieur
+    du schéma), puis le long du tracé, puis les diagonales."""
+    dx, dy = station_axis(sid)
+    px, py = -dy, dx
+    ox, oy = x - cx_map, y - cy_map
+
+    def pair(ux, uy):
+        ux, uy = _unit(ux, uy)
+        if ox * ux + oy * uy >= 0:
+            return [(ux, uy), (-ux, -uy)]
+        return [(-ux, -uy), (ux, uy)]
+
+    dirs = []
+    dirs.extend(pair(px, py))
+    dirs.extend(pair(dx, dy))
+    dirs.extend(pair(px + dx, py + dy))
+    dirs.extend(pair(px - dx, py - dy))
+    return dirs
+
 
 for sid in to_label:
     info = gares_dict[sid]
@@ -785,19 +886,22 @@ for sid in to_label:
     placed = None
     is_default = False
     # Plus de rayons candidats en mode Schéma : beaucoup plus d'étiquettes à caser.
-    max_r = 9 if schema_mode else 6
+    max_r = 10 if schema_mode else 7
+    directions = _label_dirs(sid, x, y)
     for r in range(1, max_r):
-        for di, (dx, dy) in enumerate(DIRECTIONS):
-            offx = (half_rw + text_w / 2 + gap_lbl) * r if dx != 0 else 0
-            offy = (half_rh + text_h / 2 + gap_lbl) * r if dy != 0 else 0
-            cx_l = x + dx * offx
-            cy_l = y + dy * offy
+        for di, (ux, uy) in enumerate(directions):
+            off = (_exit_dist(half_rw, half_rh, ux, uy)
+                   + _exit_dist(text_w / 2, text_h / 2, ux, uy)
+                   + gap_lbl) * r
+            cx_l = x + ux * off
+            cy_l = y + uy * off
             bbox = (cx_l - text_w / 2, cy_l - text_h / 2,
                     cx_l + text_w / 2, cy_l + text_h / 2)
-            # rester dans le cadre (donc dans le fond OSM)
             if bbox[0] < lim[0] or bbox[1] < lim[1] or bbox[2] > lim[2] or bbox[3] > lim[3]:
                 continue
             if any(_overlap(bbox, o) for o in occupied):
+                continue
+            if _hits_lines(bbox):
                 continue
             placed = (cx_l, cy_l, bbox)
             is_default = (r == 1 and di == 0)
@@ -806,22 +910,27 @@ for sid in to_label:
             break
 
     if placed is None:
-        # Repli : balayage d'une grille sur tout le cadre. On retient l'emplacement
-        # LIBRE le plus proche de la gare ; si aucun n'est libre (cadre saturé), on
-        # prend le moins chevauchant. Évite les étiquettes qui se superposent
-        # franchement en mode Schéma (toutes les gares étant nommées).
-        step = max(text_h * 0.6, meters_per_point * 5)
+        # Repli : grille LOCALE autour de la gare (pas tout le cadre : trop
+        # coûteux, et une étiquette trop loin n'est plus lisible).
+        step = max(text_h * 0.7, meters_per_point * 6)
+        search_r = max(text_w, text_h) * (12 if schema_mode else 8)
+        gx0 = max(lim[0] + text_w / 2, x - search_r)
+        gx1 = min(lim[2] - text_w / 2, x + search_r)
+        gy0 = max(lim[1] + text_h / 2, y - search_r)
+        gy1 = min(lim[3] - text_h / 2, y + search_r)
         best_free = None
         best_free_d = None
         best_any = None
         best_ov = None
-        gx = lim[0] + text_w / 2
-        while gx <= lim[2] - text_w / 2:
-            gy = lim[1] + text_h / 2
-            while gy <= lim[3] - text_h / 2:
+        gx = gx0
+        while gx <= gx1:
+            gy = gy0
+            while gy <= gy1:
                 bbox = (gx - text_w / 2, gy - text_h / 2,
                         gx + text_w / 2, gy + text_h / 2)
                 ov = sum(_overlap_area(bbox, o) for o in occupied)
+                if _hits_lines(bbox):
+                    ov += text_w * text_h
                 d = (gx - x) ** 2 + (gy - y) ** 2
                 if ov == 0.0:
                     if best_free_d is None or d < best_free_d:
@@ -848,7 +957,7 @@ for sid in to_label:
                 zorder=6, clip_on=True)
     ax.text(cx_l, cy_l, nom, fontsize=fontsize, fontweight=fontweight,
             zorder=7, color='black', ha='center', va='center', clip_on=True,
-            bbox=dict(facecolor='white', alpha=0.75, edgecolor='none', boxstyle='round,pad=0.2'))
+            bbox=dict(facecolor='white', alpha=0.82, edgecolor='none', boxstyle='round,pad=0.2'))
     occupied.append(bbox)
 
 # 10. Fond de carte géographique OSM clair (mode carte uniquement ; le mode
@@ -872,17 +981,18 @@ def build_legend_figure():
             labels.append(lbl)
             mission_handles.append(Line2D(
                 [0], [0], color=od['color'], lw=freq_to_lw(od['freq_tph']),
-                path_effects=white_outline(freq_to_lw(od['freq_tph'])),
                 label=lbl))
+    sample_c = next((od['color'] for od in st.session_state.ods
+                     if len(od['steps']) >= 2), '#4E79A7')
     gare_handles = [
-        Patch(facecolor=COLORS_TYPE_GARE['a'], edgecolor='black', label="Gare type A"),
-        Patch(facecolor=COLORS_TYPE_GARE['b'], edgecolor='black', label="Gare type B"),
-        Patch(facecolor=COLORS_TYPE_GARE['c'], edgecolor='#555555', label="Gare type C"),
-        Patch(facecolor=COLORS_TYPE_GARE['default'], edgecolor='#555555', label="Autre gare"),
+        Patch(facecolor=sample_c, edgecolor='#111111',
+              label="Gare desservie (une mission)"),
+        Patch(facecolor='#FFFFFF', edgecolor='#111111', linewidth=1.5,
+              label="Correspondance (plusieurs missions)"),
     ]
     n_rows = len(mission_handles) + len(gare_handles) + 2
     # Largeur adaptée au libellé le plus long pour éviter toute troncature.
-    max_len = max([len(l) for l in labels] + [len("Types de gare"), 20])
+    max_len = max([len(l) for l in labels] + [len("Correspondance (plusieurs missions)"), 20])
     fig_w = max(5.0, 0.115 * max_len + 1.2)
     fig_l, ax_l = plt.subplots(figsize=(fig_w, max(2.0, 0.34 * n_rows)))
     ax_l.axis('off')
@@ -894,7 +1004,7 @@ def build_legend_figure():
                        title_fontproperties={'weight': 'bold', 'size': 11})
     ax_l.add_artist(leg1)
     ax_l.legend(handles=gare_handles, loc='lower left', bbox_to_anchor=(0.0, 0.02),
-                title="Types de gare", frameon=False, fontsize=10,
+                title="Gares", frameon=False, fontsize=10,
                 title_fontproperties={'weight': 'bold', 'size': 11})
     return fig_l
 
