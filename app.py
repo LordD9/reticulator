@@ -145,15 +145,86 @@ def format_station(uic):
     return gares_dict.get(uic, {}).get('nom', uic)
 
 def offset_line(geom, offset):
-    """Safely offset a LineString."""
-    if offset == 0:
+    """Offset a LineString without crashing GEOS on dense alpine tracks.
+
+    ``offset_curve`` on a very wiggly LineString (ex. Aix–Briançon) with an
+    offset of hundreds of metres can raise
+    ``GEOSException: cannot create std::vector larger than max_size()``.
+    Simplify first, prefer mitre joins, and fall back to the original geom.
+    """
+    if geom is None or getattr(geom, 'is_empty', True):
         return geom
-    if hasattr(geom, 'offset_curve'):
-        return geom.offset_curve(offset)
+    try:
+        off = float(offset)
+    except (TypeError, ValueError):
+        return geom
+    if not math.isfinite(off) or abs(off) < 1e-9:
+        return geom
+
+    def _clean(ls):
+        coords = []
+        for x, y, *_rest in ls.coords:
+            if not (math.isfinite(x) and math.isfinite(y)):
+                continue
+            if coords and abs(x - coords[-1][0]) < 1e-6 and abs(y - coords[-1][1]) < 1e-6:
+                continue
+            coords.append((x, y))
+        if len(coords) < 2:
+            return None
+        out = LineString(coords)
+        if out.length <= 0:
+            return None
+        # Tolerance in metres: enough to drop switchback spikes that explode GEOS.
+        tol = max(25.0, min(abs(off) * 0.5, 250.0))
+        try:
+            simp = out.simplify(tol, preserve_topology=False)
+            if (simp is not None and not simp.is_empty
+                    and simp.geom_type == 'LineString' and simp.length > 0):
+                out = simp
+        except Exception:
+            pass
+        return out
+
+    def _one(ls):
+        ls = _clean(ls)
+        if ls is None:
+            return None
+        try:
+            if hasattr(ls, 'offset_curve'):
+                try:
+                    res = ls.offset_curve(off, join_style='mitre', mitre_limit=2.5)
+                except TypeError:
+                    res = ls.offset_curve(off)
+            else:
+                side = 'left' if off > 0 else 'right'
+                res = ls.parallel_offset(abs(off), side)
+        except Exception:
+            return ls
+        if res is None or res.is_empty:
+            return ls
+        return res
+
+    parts = []
+    if geom.geom_type == 'LineString':
+        src = [geom]
     else:
-        # Fallback pour shapely < 2.0
-        side = 'left' if offset > 0 else 'right'
-        return geom.parallel_offset(abs(offset), side)
+        src = [g for g in getattr(geom, 'geoms', []) if g.geom_type == 'LineString']
+    for p in src:
+        q = _one(p)
+        if q is None or q.is_empty:
+            continue
+        if q.geom_type == 'LineString':
+            parts.append(q)
+        else:
+            parts.extend(
+                g for g in getattr(q, 'geoms', [])
+                if g.geom_type == 'LineString' and not g.is_empty
+            )
+    if not parts:
+        return geom
+    if len(parts) == 1:
+        return parts[0]
+    return MultiLineString(parts)
 
 
 def contourne_gare(geom, px, py, radius, prefer_dx, prefer_dy):
@@ -594,7 +665,10 @@ def oriented_offset(geom, canonical, od_idx):
         return translate(geom, ox, oy)
     off = segment_offsets.get((canonical, od_idx), 0.0)
     off = off * segment_sign.get(canonical, 1.0)
-    return offset_line(geom, off)
+    try:
+        return offset_line(geom, off)
+    except Exception:
+        return geom
 
 
 fig, ax = plt.subplots(figsize=(16, 12))
