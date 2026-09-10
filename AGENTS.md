@@ -59,9 +59,9 @@ L'écosystème comprend deux approches visuelles :
 1.  **Application Streamlit (`app.py`) (Référence)** :
     *   S'appuie sur **Streamlit** pour l'interactivité (périmètre, 8 missions, gares desservies vs passage sans arrêt).
     *   Génère les cartes avec **Matplotlib** (mode carte OSM ou mode schéma orthogonal), export PNG carte + légende.
-    *   **Style gares (plan type RATP)** : une mission → carré de la couleur de la mission ; plusieurs missions → carré blanc à contour noir. Le *type* de gare (A/B/C) ne colore plus le symbole : il pilote uniquement l'affichage du nom (a/b en mode carte, toutes en mode schéma, taille de police selon le type).
+    *   **Style gares (plan type RATP)** : une mission → rond de la couleur de la mission (sans contour) ; plusieurs missions → carré blanc à contour noir. Passage sans arrêt : le trait contourne le symbole, toujours du même côté du corridor. Le *type* de gare (A/B/C) ne colore plus le symbole : il pilote uniquement l'affichage du nom (a/b en mode carte, toutes en mode schéma, taille de police selon le type).
     *   **Offset de corridor** : missions empilées jointives, ordre = indice de mission. Mode carte : `signes_offset_corridor` + `offset_curve`. Mode schéma : `offsets_faisceau_schematique` (rails colinéaires fusionnés, translation X/Y) pour éviter la superposition quand deux missions partagent un axe sans partager les mêmes gares.
-    *   **Passage sans arrêt** : pas de symbole si aucune mission ne dessert la gare ; si d'autres s'y arrêtent, un extrait local de la ligne (sans casing blanc) est redessiné au-dessus du carré (`zorder=6`).
+    *   **Passage sans arrêt** : pas de symbole si aucune mission ne dessert la gare ; si d'autres s'y arrêtent, `contourne_gare` décale le trait (V vers un apex, même côté que l offset de corridor). Plus de redraw zorder=6 par-dessus le symbole.
 2.  **Dashboard HTML (Legacy)** : Autonome (single-file HTML) basé sur **Leaflet.js** et `leaflet-polylineoffset`.
 
 ---
