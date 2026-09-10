@@ -3,11 +3,12 @@ from collections import deque
 import streamlit as st
 import streamlit.components.v1 as components
 import matplotlib.pyplot as plt
-from matplotlib.patches import Polygon, Patch
+from matplotlib.patches import Circle, Polygon, Patch
 from matplotlib.lines import Line2D
 import networkx as nx
 import pandas as pd
-from shapely.geometry import LineString, Point, box
+from shapely.geometry import LineString, MultiLineString, Point, box
+from shapely.ops import substring
 from shapely.strtree import STRtree
 from shapely.affinity import translate
 import contextily as cx
@@ -153,6 +154,88 @@ def offset_line(geom, offset):
         # Fallback pour shapely < 2.0
         side = 'left' if offset > 0 else 'right'
         return geom.parallel_offset(abs(offset), side)
+
+
+def contourne_gare(geom, px, py, radius, prefer_dx, prefer_dy):
+    """Contourne le disque (px, py, radius) du côté `prefer`, sans inverser.
+
+    Le morceau dans le disque est remplacé par un V (entrée → apex → sortie).
+    Deux tronçons qui se touchent à la gare se rejoignent au même apex, donc
+    le trait reste du même côté tout le long de la ligne.
+    """
+    if geom is None or geom.is_empty or radius <= 0:
+        return geom
+    n = math.hypot(prefer_dx, prefer_dy)
+    if n < 1e-9:
+        prefer_dx, prefer_dy, n = 1.0, 0.0, 1.0
+    prefer_dx, prefer_dy = prefer_dx / n, prefer_dy / n
+    apex = (px + prefer_dx * radius, py + prefer_dy * radius)
+    disk = Point(px, py).buffer(radius)
+
+    def _one(ls):
+        if ls is None or ls.is_empty or ls.length <= 0:
+            return ls
+        if not ls.intersects(disk):
+            return ls
+        hits = ls.intersection(disk.boundary)
+        pts = []
+        if hits.geom_type == 'Point':
+            pts = [hits]
+        elif hits.geom_type == 'MultiPoint':
+            pts = list(hits.geoms)
+        elif hits.geom_type == 'GeometryCollection':
+            pts = [g for g in hits.geoms if g.geom_type == 'Point']
+        pts = sorted(pts, key=lambda p: ls.project(p))
+        start_in = disk.intersects(Point(ls.coords[0]))
+        end_in = disk.intersects(Point(ls.coords[-1]))
+        if start_in and end_in:
+            return LineString([ls.coords[0], apex, ls.coords[-1]])
+        if not pts:
+            return ls
+        if start_in:
+            after = substring(ls, ls.project(pts[0]), ls.length)
+            coords = [apex]
+            if after is not None and not after.is_empty:
+                coords.extend(list(after.coords))
+            return LineString(coords) if len(coords) >= 2 else ls
+        if end_in:
+            before = substring(ls, 0.0, ls.project(pts[-1]))
+            coords = []
+            if before is not None and not before.is_empty:
+                coords.extend(list(before.coords))
+            coords.append(apex)
+            return LineString(coords) if len(coords) >= 2 else ls
+        if len(pts) >= 2:
+            d0, d1 = ls.project(pts[0]), ls.project(pts[-1])
+            if d1 <= d0:
+                return ls
+            before = substring(ls, 0.0, d0)
+            after = substring(ls, d1, ls.length)
+            coords = []
+            if before is not None and not before.is_empty:
+                coords.extend(list(before.coords))
+            coords.append(apex)
+            if after is not None and not after.is_empty:
+                ac = list(after.coords)
+                if coords and ac and coords[-1] == ac[0]:
+                    ac = ac[1:]
+                coords.extend(ac)
+            return LineString(coords) if len(coords) >= 2 else ls
+        return ls
+
+    if geom.geom_type == 'LineString':
+        return _one(geom)
+    parts = []
+    for g in getattr(geom, 'geoms', []):
+        if g.geom_type == 'LineString':
+            ng = _one(g)
+            if ng is not None and not ng.is_empty:
+                parts.append(ng)
+    if not parts:
+        return geom
+    if len(parts) == 1:
+        return parts[0]
+    return MultiLineString(parts)
 
 # Messages d'édition de trajet : affichés hors des expanders (repliés par défaut).
 for _i in range(len(st.session_state.ods)):
@@ -370,7 +453,7 @@ st.markdown(
     "mêmes voies (offset). **Une gare desservie par une seule mission prend la "
     "couleur de cette mission ; une correspondance (plusieurs missions) est un "
     "carré blanc à contour noir.** Si une gare est décochée (passage sans arrêt), "
-    "la ligne passe au-dessus du symbole. L'épaisseur des traits est "
+    "le trait contourne le symbole, toujours du même côté. L'épaisseur des traits est "
     "proportionnelle à la fréquence ; sur un même faisceau les couleurs sont "
     "jointives, dans un ordre constant."
 )
@@ -654,6 +737,66 @@ def _line_parts(geom):
             yield g
 
 
+# Missions qui DESSERVENT une gare (un passage sans arrêt ne compte pas).
+station_served_by = {}
+incident_segments = {}
+station_bundle = {}
+for canonical in segment_users:
+    for sid in canonical:
+        incident_segments.setdefault(sid, []).append(canonical)
+        station_bundle[sid] = max(station_bundle.get(sid, 0.0), segment_width_m[canonical])
+for od in st.session_state.ods:
+    if len(od['steps']) < 2:
+        continue
+    for sid in od['served_stations']:
+        if sid in drawn_stations:
+            station_served_by.setdefault(sid, []).append(od['idx'])
+
+min_sq = meters_per_point * 8
+station_radius = {}
+for sid in drawn_stations:
+    if station_served_by.get(sid):
+        side = max(min_sq, station_bundle.get(sid, 0.0) + meters_per_point * 2.5)
+        station_radius[sid] = side / 2.0
+
+
+def skip_prefer_vec(canonical, od_idx, geom):
+    """Perpendiculaire au tracé, même côté que l offset de corridor (pas d inversion)."""
+    coords = []
+    if geom is not None and not geom.is_empty:
+        if geom.geom_type == 'LineString':
+            coords = list(geom.coords)
+        else:
+            for g in getattr(geom, 'geoms', []):
+                if g.geom_type == 'LineString' and not g.is_empty:
+                    coords = list(g.coords)
+                    break
+    if len(coords) < 2:
+        return (1.0, 0.0)
+    vx = coords[-1][0] - coords[0][0]
+    vy = coords[-1][1] - coords[0][1]
+    n = math.hypot(vx, vy)
+    if n < 1e-9:
+        return (1.0, 0.0)
+    left = (-vy / n, vx / n)
+    if schema_mode:
+        ox, oy = schematic_shift.get((canonical, od_idx), (0.0, 0.0))
+        if abs(ox) + abs(oy) > 1e-9:
+            return (ox, oy)
+        sgn = 1.0
+    else:
+        off = segment_offsets.get((canonical, od_idx), 0.0)
+        sgn = segment_sign.get(canonical, 1.0)
+        side = off * sgn
+        if side < 0:
+            return (-left[0], -left[1])
+        if side > 0:
+            return left
+    if sgn < 0:
+        return (-left[0], -left[1])
+    return left
+
+
 # 6. Lignes de mission : casing blanc sous le faisceau (z=3), couleurs jointives
 #    (z=4), sans path_effects. Le blanc ne reste visible que sur le pourtour.
 painted_lines = []  # (LineString, largeur_m) pour l'anti-collision des étiquettes
@@ -663,6 +806,17 @@ for canonical_edge, raw_users in segment_users.items():
         od = st.session_state.ods[od_idx]
         shifted_geom = oriented_offset(geom, canonical_edge, od_idx)
         if shifted_geom.is_empty:
+            continue
+        for sid in canonical_edge:
+            if sid in od.get('served_stations', []):
+                continue
+            if sid not in station_served_by:
+                continue
+            r = station_radius.get(sid, min_sq / 2.0) + 0.55 * widths_by_od.get(od_idx, min_sq)
+            pdx, pdy = skip_prefer_vec(canonical_edge, od_idx, shifted_geom)
+            shifted_geom = contourne_gare(
+                shifted_geom, pos[sid][0], pos[sid][1], r, pdx, pdy)
+        if shifted_geom is None or shifted_geom.is_empty:
             continue
         lw = freq_to_lw(od['freq_tph'])
         join = 'miter' if schema_mode else 'round'
@@ -676,26 +830,10 @@ for canonical_edge, raw_users in segment_users.items():
                     solid_capstyle='round', solid_joinstyle=join)
             painted_lines.append((ls, lw * meters_per_point))
 
-# 7. Gares (Z-order: 5) — style inspiré du plan de métro RATP :
-#    - desservie par UNE mission : carré de la couleur de la mission ;
-#    - desservie par PLUSIEURS missions : carré blanc, contour noir ;
-#    - passage sans arrêt uniquement : pas de symbole (la ligne traverse).
-#    Le carré est orienté sur le faisceau et dimensionné pour le couvrir.
-incident_segments = {}   # sid -> [canonical, ...] segments touchant la gare
-station_bundle = {}      # sid -> largeur du faisceau le plus large (mètres)
-station_served_by = {}   # sid -> [od_idx, ...] missions qui DESSERVENT la gare
-for canonical in segment_users:
-    for sid in canonical:
-        incident_segments.setdefault(sid, []).append(canonical)
-        station_bundle[sid] = max(station_bundle.get(sid, 0.0), segment_width_m[canonical])
-for od in st.session_state.ods:
-    if len(od['steps']) < 2:
-        continue
-    for sid in od['served_stations']:
-        if sid in drawn_stations:
-            station_served_by.setdefault(sid, []).append(od['idx'])
-
-
+# 7. Gares (Z-order: 5)
+#    - UNE mission qui s arrete : rond couleur, sans contour
+#    - PLUSIEURS missions : carre blanc, contour noir
+#    - personne ne s arrete : pas de symbole
 def station_axis(sid):
     """Direction unitaire (dx, dy) du faisceau de missions le plus large incident
     à la gare, servant à orienter le carré sur les traits.
@@ -724,7 +862,6 @@ def station_axis(sid):
     return best_dir
 
 
-min_sq = meters_per_point * 8       # côté mini d'un carré de gare
 station_rects = {}  # sid -> (rx0, ry0, rx1, ry1) bbox englobante (anti-collision)
 for sid in drawn_stations:
     x, y = pos[sid]
@@ -732,64 +869,37 @@ for sid in drawn_stations:
     dx, dy = station_axis(sid)
     nx_, ny_ = -dy, dx
     if served:
-        # Carré un peu plus large que le faisceau pour que le contour reste visible.
-        side = max(min_sq, station_bundle.get(sid, 0.0) + meters_per_point * 2.5)
+        rad = station_radius.get(sid, min_sq / 2.0)
         if len(served) == 1:
-            face, edge, elw = st.session_state.ods[served[0]]['color'], '#111111', 1.1
+            circ = Circle(
+                (x, y), rad,
+                facecolor=st.session_state.ods[served[0]]['color'],
+                edgecolor='none', linewidth=0, zorder=5,
+            )
+            circ.set_clip_on(True)
+            ax.add_patch(circ)
+            station_rects[sid] = (x - rad, y - rad, x + rad, y + rad)
         else:
-            face, edge, elw = '#FFFFFF', '#111111', 1.7
-        hs = side / 2.0
-        corners = [
-            (x + hs * dx + hs * nx_, y + hs * dy + hs * ny_),
-            (x + hs * dx - hs * nx_, y + hs * dy - hs * ny_),
-            (x - hs * dx - hs * nx_, y - hs * dy - hs * ny_),
-            (x - hs * dx + hs * nx_, y - hs * dy + hs * ny_),
-        ]
-        poly = Polygon(corners, closed=True, facecolor=face, edgecolor=edge,
-                       linewidth=elw, zorder=5, joinstyle='miter')
-        poly.set_clip_on(True)
-        ax.add_patch(poly)
-        xs_c = [c[0] for c in corners]
-        ys_c = [c[1] for c in corners]
-        station_rects[sid] = (min(xs_c), min(ys_c), max(xs_c), max(ys_c))
+            hs = rad
+            corners = [
+                (x + hs * dx + hs * nx_, y + hs * dy + hs * ny_),
+                (x + hs * dx - hs * nx_, y + hs * dy - hs * ny_),
+                (x - hs * dx - hs * nx_, y - hs * dy - hs * ny_),
+                (x - hs * dx + hs * nx_, y - hs * dy + hs * ny_),
+            ]
+            poly = Polygon(corners, closed=True, facecolor='#FFFFFF', edgecolor='#111111',
+                           linewidth=1.7, zorder=5, joinstyle='miter')
+            poly.set_clip_on(True)
+            ax.add_patch(poly)
+            xs_c = [c[0] for c in corners]
+            ys_c = [c[1] for c in corners]
+            station_rects[sid] = (min(xs_c), min(ys_c), max(xs_c), max(ys_c))
     else:
-        # Passage sans arrêt : pas de symbole, juste une emprise pour les labels.
         pad = meters_per_point * 4
         station_rects[sid] = (x - pad, y - pad, x + pad, y + pad)
 
-# 8. Passage sans arrêt AU-DESSUS d'une gare desservie par d'autres missions :
-#    on redessine un extrait LOCAL (rayon = côté du carré, pas un km) par-dessus
-#    le symbole, SANS casing blanc — c'est ce casing + un rayon trop large qui
-#    produisait l'effet « boudin ».
-for od in st.session_state.ods:
-    if len(od['steps']) < 2:
-        continue
-    for i in range(len(od['steps']) - 1):
-        u = od['steps'][i]
-        v = od['steps'][i + 1]
-        canonical = tuple(sorted((u, v)))
-        shifted_geom = oriented_offset(
-            get_edge_geom(canonical[0], canonical[1]),
-            canonical, od['idx'])
-        lw = freq_to_lw(od['freq_tph'])
-        for sid in (u, v):
-            if sid in od['served_stations']:
-                continue
-            if sid not in station_served_by:
-                continue  # personne ne s'arrête : pas de symbole à recouvrir
-            rx0, ry0, rx1, ry1 = station_rects[sid]
-            catch_radius = 0.55 * max(rx1 - rx0, ry1 - ry0)
-            station_pt = Point(*pos[sid])
-            local_seg = shifted_geom.intersection(station_pt.buffer(catch_radius))
-            if local_seg.is_empty:
-                continue
-            for ls in _line_parts(local_seg):
-                xs, ys = ls.xy
-                ax.plot(xs, ys, color=od['color'], linewidth=lw, zorder=6,
-                        solid_capstyle='butt', solid_joinstyle='miter')
-
-# 9. Étiquettes de gares avec anti-collision (gares + tracés) et trait de rappel.
-#    - Mode carte : seules les gares de type a/b sont nommées (lisibilité du fond).
+# 9. Etiquettes de gares avec anti-collision (gares + traces) et trait de rappel.
+#    - Mode carte : seules les gares de type a/b sont nommees (lisibilite du fond).
 #    - Mode Schéma : TOUTES les gares sont nommées, taille de police selon le type
 #      (a > b > c > autre). Les couleurs de gare ne dépendent plus du type.
 def _overlap(a, b):
@@ -1022,8 +1132,9 @@ def build_legend_figure():
     sample_c = next((od['color'] for od in st.session_state.ods
                      if len(od['steps']) >= 2), '#4E79A7')
     gare_handles = [
-        Patch(facecolor=sample_c, edgecolor='#111111',
-              label="Gare desservie (une mission)"),
+        Line2D([0], [0], marker='o', color='none', markerfacecolor=sample_c,
+               markeredgewidth=0, markersize=11, linestyle='None',
+               label="Gare desservie (une mission)"),
         Patch(facecolor='#FFFFFF', edgecolor='#111111', linewidth=1.5,
               label="Correspondance (plusieurs missions)"),
     ]
