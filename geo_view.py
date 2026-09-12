@@ -18,8 +18,20 @@ def _xy_to_latlon(xs, ys):
         return [(float(lats), float(lons))] if math.isfinite(lats) else []
 
 
-def folium_map_html(tracks, stations, height=760):
-    """tracks: {xs, ys, color, weight}; stations: {kind, xs, ys, color, nom}."""
+IGN_PLAN_URL = (
+    "https://data.geopf.fr/wmts?SERVICE=WMTS&REQUEST=GetTile&VERSION=1.0.0"
+    "&LAYER=GEOGRAPHICALGRIDSYSTEMS.PLANIGNV2&STYLE=normal&FORMAT=image/png"
+    "&TILEMATRIXSET=PM&TILEMATRIX={z}&TILEROW={y}&TILECOL={x}"
+)
+IGN_ATTR = '&copy; <a href="https://www.ign.fr/">IGN</a> — Géoplateforme'
+
+
+def folium_map_html(tracks, stations, height=760, fond="carto"):
+    """tracks: {xs, ys, color, weight}; stations: {kind, xs, ys, color, nom}.
+
+    fond: 'carto' (defaut, clair) ou 'ign' (Plan IGN, sans cle API).
+    Les deux fonds restent commutables dans le controle de couches Leaflet.
+    """
     import folium
 
     pts = []
@@ -29,12 +41,27 @@ def folium_map_html(tracks, stations, height=760):
         pts.extend(_xy_to_latlon(s.get("xs", [s.get("x", 0)]), s.get("ys", [s.get("y", 0)])))
     if not pts:
         loc = [46.6, 2.5]
-        m = folium.Map(location=loc, zoom_start=6, tiles="CartoDB positron", control_scale=True)
+        m = folium.Map(location=loc, zoom_start=6, tiles=None, control_scale=True)
     else:
         lat = sum(p[0] for p in pts) / len(pts)
         lon = sum(p[1] for p in pts) / len(pts)
-        m = folium.Map(location=[lat, lon], zoom_start=9, tiles="CartoDB positron",
+        m = folium.Map(location=[lat, lon], zoom_start=9, tiles=None,
                        control_scale=True, scrollWheelZoom=True)
+    folium.TileLayer(
+        tiles="CartoDB positron",
+        name="Clair (Carto)",
+        show=(fond != "ign"),
+        control=True,
+    ).add_to(m)
+    folium.TileLayer(
+        tiles=IGN_PLAN_URL,
+        attr=IGN_ATTR,
+        name="Plan IGN",
+        overlay=False,
+        control=True,
+        show=(fond == "ign"),
+        max_zoom=19,
+    ).add_to(m)
     for t in tracks:
         latlons = _xy_to_latlon(t["xs"], t["ys"])
         if len(latlons) < 2:
@@ -75,4 +102,5 @@ def folium_map_html(tracks, stations, height=760):
         lats = [p[0] for p in pts]
         lons = [p[1] for p in pts]
         m.fit_bounds([[min(lats), min(lons)], [max(lats), max(lons)]], padding=(30, 30))
+    folium.LayerControl(collapsed=False).add_to(m)
     return m.get_root().render()

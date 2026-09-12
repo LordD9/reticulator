@@ -1,4 +1,5 @@
 import io
+import json
 from collections import deque
 import streamlit as st
 import streamlit.components.v1 as components
@@ -18,6 +19,7 @@ import math
 from branding import LOGO_PATH, composer_png_avec_logo
 from dessin_gares import capsule_polygon, contourne_obstacle
 from geo_view import folium_map_html
+from missions_io import exporter_missions, importer_missions
 from schema_reticulaire import (
     charger_donnees,
     construire_graphe,
@@ -423,6 +425,45 @@ for i, od in enumerate(st.session_state.ods):
                         )
                     st.rerun()
 
+# --- Sauvegarde / import des missions ---
+st.sidebar.markdown("---")
+st.sidebar.subheader("Sauvegarde des missions")
+_payload = json.dumps(exporter_missions(st.session_state.ods), ensure_ascii=False, indent=2)
+st.sidebar.download_button(
+    "Telecharger les 8 missions (JSON)",
+    data=_payload.encode("utf-8"),
+    file_name="missions_reticulator.json",
+    mime="application/json",
+    use_container_width=True,
+)
+_up = st.sidebar.file_uploader(
+    "Importer un fichier missions",
+    type=["json"],
+    help="Remplace les 8 missions. Les gares hors perimetre actuel sont ignorees.",
+)
+if _up is not None:
+    _raw = _up.getvalue()
+    _sig = hash(_raw)
+    if st.session_state.get("_missions_import_sig") != _sig:
+        try:
+            _ods, _warns = importer_missions(
+                _raw, gares_connues=set(gares_dict.keys()), couleurs_defaut=list(PALETTE_OD),
+            )
+            st.session_state.ods = _ods
+            st.session_state._missions_import_sig = _sig
+            st.session_state._missions_import_flash = (_warns, True)
+            st.rerun()
+        except Exception as _e:
+            st.sidebar.error(f"Import impossible : {_e}")
+
+_flash = st.session_state.pop("_missions_import_flash", None)
+if _flash:
+    _warns, _ok = _flash
+    if _ok:
+        st.sidebar.success("Missions importees.")
+    for _w in _warns:
+        st.sidebar.warning(_w)
+
 # --- MODE D'AFFICHAGE ---
 st.sidebar.markdown("---")
 st.sidebar.subheader("🖼️ Mode d'affichage")
@@ -439,9 +480,17 @@ st.sidebar.markdown("---")
 st.sidebar.subheader("🔍 Cadrage de la carte")
 st.sidebar.caption(
     "Le zoom est interactif directement sur la carte : **molette** pour zoomer/"
-    "dézoomer sous le curseur, **glisser** pour se déplacer, **double-clic** pour "
-    "réinitialiser."
+    "dézoomer sous le curseur, **glisser** pour se déplacer."
 )
+fond_carte = "carto"
+if not schema_mode:
+    _choix_fond = st.sidebar.radio(
+        "Fond de carte",
+        ["Clair (Carto)", "Plan IGN"],
+        index=0,
+        help="Plan IGN via Géoplateforme, sans clé API. Commutable aussi dans la légende Leaflet.",
+    )
+    fond_carte = "ign" if _choix_fond.startswith("Plan") else "carto"
 
 # --- GENERATION DE LA CARTE ---
 if LOGO_PATH.is_file():
@@ -1287,7 +1336,7 @@ with col_map:
         render_interactive_map(fig)
     else:
         try:
-            html = folium_map_html(leaflet_tracks, leaflet_stations, height=760)
+            html = folium_map_html(leaflet_tracks, leaflet_stations, height=760, fond=fond_carte)
             components.html(html, height=800)
             st.caption(
                 "Carte interactive : molette = zoom (tuiles et tracé à l'échelle). "
