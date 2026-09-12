@@ -702,14 +702,14 @@ ax.axis('off')
 
 # Épaisseur du trait proportionnelle à la fréquence (en points), avec un
 # minimum lisible. Utilisée partout (tracé, passages, légende) pour rester cohérent.
-LW_PER_TPH = 2.0
+LW_PER_TPH = 4.0
 # Casing extérieur du faisceau (en points), dessiné SOUS les couleurs. Les
 # couleurs elles-mêmes sont jointives (pas de liseré blanc entre missions) :
 # le blanc n'apparaît que sur le pourtour du faisceau, plus sur les joints.
 CASING_PT = 0.9
 
 def freq_to_lw(freq):
-    return max(1.2, freq * LW_PER_TPH)
+    return max(2.4, freq * LW_PER_TPH)
 
 # 1. Identifier les tronçons partagés. L'ordre d'empilement est l'indice de
 #    mission (tri croissant) : il doit rester identique d'un tronçon au
