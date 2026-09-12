@@ -33,7 +33,8 @@ graph TD
 
 ### Fichiers du Projet :
 - **`schema_reticulaire.py`** : Backend SIG. Chargement, graphe, voisinages, recollage d'un trajet sur le réseau (`inserer_gare_sur_reseau`, `retirer_gare_sur_reseau`), signes d'offset de corridor (`signes_offset_corridor`) et faisceaux schématiques colinéaires (`offsets_faisceau_schematique`).
-- **`app.py`** : Application Streamlit (référence). Missions, routage, rendu carte/schéma, export PNG.
+- `logo.png` : bloc-marque République française / Cerema, affiché dans l'UI et en bandeau des PNG.
+- `branding.py` : composition du bandeau logo sur les exports PNG (carte intacte).
 - **`gare.geojson`** : Points géographiques (WGS 84) de l'ensemble des gares d'intérêt.
 - **`reseau_ferroviaire.geojson`** : Lignes géographiques de l'infrastructure ferroviaire (MultiLineStrings).
 - **`regions_departements.json`** : Découpage région → départements (code INSEE) pour le périmètre régional.

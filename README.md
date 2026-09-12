@@ -1,6 +1,10 @@
 # Chronofer - Reticulator
 
-Reticulator est un module de l'écosystème **Chronofer** permettant de construire, calculer et visualiser des schémas réticulaires ferroviaires interactifs. 
+<p align="center">
+  <img src="logo.png" alt="République française — Cerema" width="420">
+</p>
+
+Reticulator est un module de l'écosystème **Chronofer** (Cerema) permettant de construire, calculer et visualiser des schémas réticulaires ferroviaires interactifs.
 Il transforme des données géographiques brutes (gares, réseau ferré) en un graphe topologique propre et génère des cartes d'exploitation claires (superposition de lignes, offsets géométriques, etc.).
 
 ## 🚀 Fonctionnalités
@@ -8,7 +12,7 @@ Il transforme des données géographiques brutes (gares, réseau ferré) en un g
 - Application interactive interactive sous **Streamlit** pour le paramétrage de 8 missions de desserte.
 - Décalage géométrique automatique (offsetting) des tracés en superposition pour garder une lisibilité maximale.
 - Gestion des relations de passages sans arrêt vs dessertes locales (z-order des points de gares par rapport aux lignes).
-- Export des schémas en `.png` haute définition avec légende automatique.
+- Export des schémas en `.png` haute définition avec légende automatique et bandeau logo Cerema (la carte n'est pas recouverte).
 
 ## 📦 Installation
 

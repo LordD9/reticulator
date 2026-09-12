@@ -7,3 +7,4 @@ geopandas
 pyproj
 openpyxl
 contextily
+pillow
