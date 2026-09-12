@@ -15,6 +15,7 @@ import contextily as cx
 import math
 
 # Import depuis le script existant
+from branding import LOGO_PATH, composer_png_avec_logo
 from schema_reticulaire import (
     charger_donnees,
     construire_graphe,
@@ -44,7 +45,11 @@ MISSION_PALETTE = {
     "Anthracite": "#3D3D5C",
 }
 
-st.set_page_config(page_title="Reticulator - Générateur Interactif", layout="wide")
+st.set_page_config(
+    page_title="Reticulator - Générateur Interactif",
+    layout="wide",
+    page_icon=str(LOGO_PATH) if LOGO_PATH.is_file() else None,
+)
 
 @st.cache_data(show_spinner=False)
 def load_and_build_graph(perimetre):
@@ -83,9 +88,11 @@ def load_and_build_graph(perimetre):
             
     return gares_data, reseau_clip, station_graph, gares_dict, neighbors
 
-# --- PÉRIMÈTRE GÉOGRAPHIQUE ---
-# Choix du périmètre AVANT le chargement : conditionne les données mises en cache.
-st.sidebar.title("🚄 Reticulator")
+# --- PERIMETRE GEOGRAPHIQUE ---
+# Choix du perimetre AVANT le chargement : conditionne les donnees mises en cache.
+if LOGO_PATH.is_file():
+    st.sidebar.image(str(LOGO_PATH), use_container_width=True)
+st.sidebar.title("Reticulator")
 st.sidebar.subheader("🗺️ Périmètre géographique")
 _REGIONS = noms_regions()
 _DEFAUT_REGION = "Provence-Alpes-Côte d'Azur"
@@ -517,7 +524,10 @@ st.sidebar.caption(
 )
 
 # --- GENERATION DE LA CARTE ---
+if LOGO_PATH.is_file():
+    st.image(str(LOGO_PATH), width=340)
 st.title("Générateur de Schéma Réticulaire")
+st.caption("Cerema — Chronofer / ReticuFer")
 st.markdown(
     "Ce tableau de bord permet de calculer et superposer jusqu'à 8 relations "
     "ferroviaires. Les traits se décalent automatiquement s'ils partagent les "
@@ -1340,15 +1350,17 @@ with col_leg:
 
 # --- Exports PNG distincts (carte / légende) ---
 buf_map = io.BytesIO()
-fig.savefig(buf_map, format="png", dpi=300, bbox_inches='tight')
+fig.savefig(buf_map, format="png", dpi=300, bbox_inches='tight', facecolor="white")
 buf_leg = io.BytesIO()
-fig_legend.savefig(buf_leg, format="png", dpi=300, bbox_inches='tight')
+fig_legend.savefig(buf_leg, format="png", dpi=300, bbox_inches='tight', facecolor="white")
+png_map = composer_png_avec_logo(buf_map.getvalue())
+png_leg = composer_png_avec_logo(buf_leg.getvalue(), largeur_frac=0.55)
 
 dl1, dl2 = st.columns(2)
 with dl1:
     st.download_button(
         label="📥 Exporter la carte (PNG HD)",
-        data=buf_map.getvalue(),
+        data=png_map,
         file_name="schema_reticulaire_carte.png",
         mime="image/png",
         use_container_width=True,
@@ -1356,7 +1368,7 @@ with dl1:
 with dl2:
     st.download_button(
         label="📥 Exporter la légende (PNG)",
-        data=buf_leg.getvalue(),
+        data=png_leg,
         file_name="schema_reticulaire_legende.png",
         mime="image/png",
         use_container_width=True,
