@@ -16,6 +16,8 @@ import math
 
 # Import depuis le script existant
 from branding import LOGO_PATH, composer_png_avec_logo
+from dessin_gares import capsule_polygon, contourne_obstacle
+from geo_view import folium_map_html
 from schema_reticulaire import (
     charger_donnees,
     construire_graphe,
@@ -227,88 +229,6 @@ def offset_line(geom, offset):
                 g for g in getattr(q, 'geoms', [])
                 if g.geom_type == 'LineString' and not g.is_empty
             )
-    if not parts:
-        return geom
-    if len(parts) == 1:
-        return parts[0]
-    return MultiLineString(parts)
-
-
-def contourne_gare(geom, px, py, radius, prefer_dx, prefer_dy):
-    """Contourne le disque (px, py, radius) du côté `prefer`, sans inverser.
-
-    Le morceau dans le disque est remplacé par un V (entrée → apex → sortie).
-    Deux tronçons qui se touchent à la gare se rejoignent au même apex, donc
-    le trait reste du même côté tout le long de la ligne.
-    """
-    if geom is None or geom.is_empty or radius <= 0:
-        return geom
-    n = math.hypot(prefer_dx, prefer_dy)
-    if n < 1e-9:
-        prefer_dx, prefer_dy, n = 1.0, 0.0, 1.0
-    prefer_dx, prefer_dy = prefer_dx / n, prefer_dy / n
-    apex = (px + prefer_dx * radius, py + prefer_dy * radius)
-    disk = Point(px, py).buffer(radius)
-
-    def _one(ls):
-        if ls is None or ls.is_empty or ls.length <= 0:
-            return ls
-        if not ls.intersects(disk):
-            return ls
-        hits = ls.intersection(disk.boundary)
-        pts = []
-        if hits.geom_type == 'Point':
-            pts = [hits]
-        elif hits.geom_type == 'MultiPoint':
-            pts = list(hits.geoms)
-        elif hits.geom_type == 'GeometryCollection':
-            pts = [g for g in hits.geoms if g.geom_type == 'Point']
-        pts = sorted(pts, key=lambda p: ls.project(p))
-        start_in = disk.intersects(Point(ls.coords[0]))
-        end_in = disk.intersects(Point(ls.coords[-1]))
-        if start_in and end_in:
-            return LineString([ls.coords[0], apex, ls.coords[-1]])
-        if not pts:
-            return ls
-        if start_in:
-            after = substring(ls, ls.project(pts[0]), ls.length)
-            coords = [apex]
-            if after is not None and not after.is_empty:
-                coords.extend(list(after.coords))
-            return LineString(coords) if len(coords) >= 2 else ls
-        if end_in:
-            before = substring(ls, 0.0, ls.project(pts[-1]))
-            coords = []
-            if before is not None and not before.is_empty:
-                coords.extend(list(before.coords))
-            coords.append(apex)
-            return LineString(coords) if len(coords) >= 2 else ls
-        if len(pts) >= 2:
-            d0, d1 = ls.project(pts[0]), ls.project(pts[-1])
-            if d1 <= d0:
-                return ls
-            before = substring(ls, 0.0, d0)
-            after = substring(ls, d1, ls.length)
-            coords = []
-            if before is not None and not before.is_empty:
-                coords.extend(list(before.coords))
-            coords.append(apex)
-            if after is not None and not after.is_empty:
-                ac = list(after.coords)
-                if coords and ac and coords[-1] == ac[0]:
-                    ac = ac[1:]
-                coords.extend(ac)
-            return LineString(coords) if len(coords) >= 2 else ls
-        return ls
-
-    if geom.geom_type == 'LineString':
-        return _one(geom)
-    parts = []
-    for g in getattr(geom, 'geoms', []):
-        if g.geom_type == 'LineString':
-            ng = _one(g)
-            if ng is not None and not ng.is_empty:
-                parts.append(ng)
     if not parts:
         return geom
     if len(parts) == 1:
@@ -532,8 +452,8 @@ st.markdown(
     "Ce tableau de bord permet de calculer et superposer jusqu'à 8 relations "
     "ferroviaires. Les traits se décalent automatiquement s'ils partagent les "
     "mêmes voies (offset). **Une gare desservie par une seule mission prend la "
-    "couleur de cette mission ; une correspondance (plusieurs missions) est un "
-    "carré blanc à contour noir.** Si une gare est décochée (passage sans arrêt), "
+    "couleur de cette mission ; une correspondance (plusieurs missions) est une "
+    "capsule blanche type RATP.** Si une gare est décochée (passage sans arrêt), "
     "le trait contourne le symbole, toujours du même côté. L'épaisseur des traits est "
     "proportionnelle à la fréquence ; sur un même faisceau les couleurs sont "
     "jointives, dans un ordre constant."
@@ -862,11 +782,49 @@ for od in st.session_state.ods:
             station_served_by.setdefault(sid, []).append(od['idx'])
 
 min_sq = meters_per_point * 8
+
+
+def station_axis(sid):
+    """Direction unitaire du faisceau le plus large, pour orienter la capsule."""
+    px, py = pos[sid]
+    best_w, best_dir = -1.0, (1.0, 0.0)
+    for canonical in incident_segments.get(sid, []):
+        geom = get_edge_geom(canonical[0], canonical[1])
+        L = geom.length
+        if L <= 0:
+            continue
+        step = min(L, max(L * 0.25, 300.0))
+        c0, c1 = geom.coords[0], geom.coords[-1]
+        if (c0[0] - px) ** 2 + (c0[1] - py) ** 2 <= (c1[0] - px) ** 2 + (c1[1] - py) ** 2:
+            p_end, p_ref = geom.interpolate(0.0), geom.interpolate(step)
+        else:
+            p_end, p_ref = geom.interpolate(L), geom.interpolate(L - step)
+        vx, vy = p_ref.x - p_end.x, p_ref.y - p_end.y
+        norm = math.hypot(vx, vy)
+        if norm < 1e-6:
+            continue
+        w = segment_width_m[canonical]
+        if w > best_w:
+            best_w, best_dir = w, (vx / norm, vy / norm)
+    return best_dir
+
+
 station_radius = {}
+station_obstacle = {}
+station_capsule = {}
 for sid in drawn_stations:
     if station_served_by.get(sid):
         side = max(min_sq, station_bundle.get(sid, 0.0) + meters_per_point * 2.5)
-        station_radius[sid] = side / 2.0
+        rad = side / 2.0
+        station_radius[sid] = rad
+        x, y = pos[sid]
+        if len(station_served_by[sid]) == 1:
+            station_obstacle[sid] = Point(x, y).buffer(rad)
+        else:
+            dx, dy = station_axis(sid)
+            cap = capsule_polygon(x, y, dx, dy, rad * 1.45, rad * 0.78)
+            station_capsule[sid] = cap
+            station_obstacle[sid] = cap
 
 
 def skip_prefer_vec(canonical, od_idx, geom):
@@ -909,6 +867,7 @@ def skip_prefer_vec(canonical, od_idx, geom):
 # 6. Lignes de mission : casing blanc sous le faisceau (z=3), couleurs jointives
 #    (z=4), sans path_effects. Le blanc ne reste visible que sur le pourtour.
 painted_lines = []  # (LineString, largeur_m) pour l'anti-collision des étiquettes
+leaflet_tracks = []
 for canonical_edge, raw_users in segment_users.items():
     geom = get_edge_geom(canonical_edge[0], canonical_edge[1])
     for od_idx in sorted(raw_users):
@@ -921,88 +880,69 @@ for canonical_edge, raw_users in segment_users.items():
                 continue
             if sid not in station_served_by:
                 continue
-            r = station_radius.get(sid, min_sq / 2.0) + 0.55 * widths_by_od.get(od_idx, min_sq)
+            obs = station_obstacle.get(sid)
+            if obs is None:
+                continue
+            margin = 0.75 * widths_by_od.get(od_idx, min_sq)
             pdx, pdy = skip_prefer_vec(canonical_edge, od_idx, shifted_geom)
-            shifted_geom = contourne_gare(
-                shifted_geom, pos[sid][0], pos[sid][1], r, pdx, pdy)
+            shifted_geom = contourne_obstacle(
+                shifted_geom, obs.buffer(margin), pos[sid][0], pos[sid][1],
+                pdx, pdy, extra=0.4 * margin)
         if shifted_geom is None or shifted_geom.is_empty:
             continue
         lw = freq_to_lw(od['freq_tph'])
         join = 'miter' if schema_mode else 'round'
         for ls in _line_parts(shifted_geom):
             xs, ys = ls.xy
-            # Casing en caps plats : un casing rond créerait un bulbe blanc
-            # à chaque jointure de tronçon (l'ancien effet « boudin »).
             ax.plot(xs, ys, color='white', linewidth=lw + 2 * CASING_PT, zorder=3,
                     solid_capstyle='butt', solid_joinstyle=join)
             ax.plot(xs, ys, color=od['color'], linewidth=lw, zorder=4,
                     solid_capstyle='round', solid_joinstyle=join)
             painted_lines.append((ls, lw * meters_per_point))
+            leaflet_tracks.append({"xs": list(xs), "ys": list(ys), "color": od['color'], "weight": lw})
 
 # 7. Gares (Z-order: 5)
-#    - UNE mission qui s arrete : rond couleur, sans contour
-#    - PLUSIEURS missions : carre blanc, contour noir
+#    - UNE mission : rond couleur, sans contour
+#    - PLUSIEURS missions : capsule blanche type RATP, contour noir
 #    - personne ne s arrete : pas de symbole
-def station_axis(sid):
-    """Direction unitaire (dx, dy) du faisceau de missions le plus large incident
-    à la gare, servant à orienter le carré sur les traits.
-    Renvoie (1, 0) par défaut si aucune direction exploitable."""
-    px, py = pos[sid]
-    best_w, best_dir = -1.0, (1.0, 0.0)
-    for canonical in incident_segments.get(sid, []):
-        geom = get_edge_geom(canonical[0], canonical[1])
-        L = geom.length
-        if L <= 0:
-            continue
-        step = min(L, max(L * 0.25, 300.0))
-        # La gare est à l'une des deux extrémités de la géométrie centrale.
-        c0, c1 = geom.coords[0], geom.coords[-1]
-        if (c0[0] - px) ** 2 + (c0[1] - py) ** 2 <= (c1[0] - px) ** 2 + (c1[1] - py) ** 2:
-            p_end, p_ref = geom.interpolate(0.0), geom.interpolate(step)
-        else:
-            p_end, p_ref = geom.interpolate(L), geom.interpolate(L - step)
-        vx, vy = p_ref.x - p_end.x, p_ref.y - p_end.y
-        norm = math.hypot(vx, vy)
-        if norm < 1e-6:
-            continue
-        w = segment_width_m[canonical]
-        if w > best_w:
-            best_w, best_dir = w, (vx / norm, vy / norm)
-    return best_dir
-
-
-station_rects = {}  # sid -> (rx0, ry0, rx1, ry1) bbox englobante (anti-collision)
+leaflet_stations = []
+station_rects = {}
 for sid in drawn_stations:
     x, y = pos[sid]
     served = station_served_by.get(sid, [])
-    dx, dy = station_axis(sid)
-    nx_, ny_ = -dy, dx
+    nom = format_station(sid)
     if served:
         rad = station_radius.get(sid, min_sq / 2.0)
         if len(served) == 1:
+            col = st.session_state.ods[served[0]]['color']
             circ = Circle(
                 (x, y), rad,
-                facecolor=st.session_state.ods[served[0]]['color'],
+                facecolor=col,
                 edgecolor='none', linewidth=0, zorder=5,
             )
             circ.set_clip_on(True)
             ax.add_patch(circ)
             station_rects[sid] = (x - rad, y - rad, x + rad, y + rad)
+            leaflet_stations.append({
+                "kind": "circle", "x": x, "y": y, "color": col,
+                "radius_px": 8, "nom": nom,
+            })
         else:
-            hs = rad
-            corners = [
-                (x + hs * dx + hs * nx_, y + hs * dy + hs * ny_),
-                (x + hs * dx - hs * nx_, y + hs * dy - hs * ny_),
-                (x - hs * dx - hs * nx_, y - hs * dy - hs * ny_),
-                (x - hs * dx + hs * nx_, y - hs * dy + hs * ny_),
-            ]
-            poly = Polygon(corners, closed=True, facecolor='#FFFFFF', edgecolor='#111111',
-                           linewidth=1.7, zorder=5, joinstyle='miter')
+            cap = station_capsule.get(sid)
+            if cap is None:
+                dx, dy = station_axis(sid)
+                cap = capsule_polygon(x, y, dx, dy, rad * 1.45, rad * 0.78)
+            coords = list(cap.exterior.coords)
+            poly = Polygon(coords, closed=True, facecolor='#FFFFFF', edgecolor='#111111',
+                           linewidth=1.7, zorder=5, joinstyle='round')
             poly.set_clip_on(True)
             ax.add_patch(poly)
-            xs_c = [c[0] for c in corners]
-            ys_c = [c[1] for c in corners]
+            xs_c = [c[0] for c in coords]
+            ys_c = [c[1] for c in coords]
             station_rects[sid] = (min(xs_c), min(ys_c), max(xs_c), max(ys_c))
+            leaflet_stations.append({
+                "kind": "capsule", "xs": xs_c, "ys": ys_c, "nom": nom,
+            })
     else:
         pad = meters_per_point * 4
         station_rects[sid] = (x - pad, y - pad, x + pad, y + pad)
@@ -1259,7 +1199,7 @@ def build_legend_figure():
                markeredgewidth=0, markersize=11, linestyle='None',
                label="Gare desservie (une mission)"),
         Patch(facecolor='#FFFFFF', edgecolor='#111111', linewidth=1.5,
-              label="Correspondance (plusieurs missions)"),
+              label="Correspondance (capsule, plusieurs missions)"),
     ]
     n_rows = len(mission_handles) + len(gare_handles) + 2
     # Largeur adaptée au libellé le plus long pour éviter toute troncature.
@@ -1343,7 +1283,19 @@ def render_interactive_map(figure, height=760):
 # --- Affichage Streamlit : carte et légende côte à côte, sans superposition ---
 col_map, col_leg = st.columns([4, 1])
 with col_map:
-    render_interactive_map(fig)
+    if schema_mode:
+        render_interactive_map(fig)
+    else:
+        try:
+            html = folium_map_html(leaflet_tracks, leaflet_stations, height=760)
+            components.html(html, height=800)
+            st.caption(
+                "Carte interactive : molette = zoom (tuiles et tracé à l'échelle). "
+                "L'export PNG ci-dessous reste la vue d'ensemble."
+            )
+        except Exception:
+            st.warning("Carte interactive indisponible, affichage SVG de repli.")
+            render_interactive_map(fig)
 with col_leg:
     st.markdown("**Légende**")
     st.pyplot(fig_legend)
