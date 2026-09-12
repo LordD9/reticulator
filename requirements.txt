@@ -8,3 +8,4 @@ pyproj
 openpyxl
 contextily
 pillow
+folium
