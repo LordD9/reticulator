@@ -529,7 +529,7 @@ st.markdown(
     "jointives, dans un ordre constant."
 )
 if schema_mode:
-    st.info("📐 **Mode Schéma actif** : rendu simplifié à angles droits, gares alignées et espacement régularisé, toutes les gares nommées. L'export reprend cette version.")
+    st.info("Mode Schema actif : angles droits, longs sauts tasses, periurbain ecarte, tous les noms sans chevauchement. Export identique.")
 
 # Espacement schématique de référence (unités ~métriques pour rester cohérent
 # avec les marges et conversions mètres<->points existantes).
@@ -590,9 +590,13 @@ def compute_schematic_layout(stations, segments, gd):
     med = med or 1.0
 
     def spacing(d):
-        # Proportionnel à la distance réelle mais borné : préserve les écarts
-        # relatifs tout en compressant les très longues branches.
-        return SCHEMA_UNIT * min(2.0, max(0.55, d / med))
+        # Périurbain (petites distances) : plancher haut pour que chaque gare
+        # ait de la place pour son nom. Intercité : compression log, pour que
+        # les longs sauts ne bouffent pas tout le cadre (sinon le périurbain
+        # devient illisible au zoom global).
+        r = max(float(d), 1.0) / med
+        raw = 0.92 + 0.28 * math.log1p(r)
+        return SCHEMA_UNIT * min(1.30, max(0.95, raw))
 
     cell = SCHEMA_UNIT * 0.25
 
@@ -645,6 +649,27 @@ def compute_schematic_layout(stations, segments, gd):
         remaining -= set(placed)
         # Composante suivante décalée à droite pour éviter tout recouvrement.
         comp_offset_x = max(pos[s][0] for s in placed) + SCHEMA_UNIT * 3
+
+    # Garantit un écart min entre gares voisines (noms lisibles en périurbain).
+    min_gap = SCHEMA_UNIT * 0.95
+    for _ in range(6):
+        moved = False
+        for a, b in segments:
+            if a not in pos or b not in pos:
+                continue
+            x0, y0 = pos[a]
+            x1, y1 = pos[b]
+            dist = math.hypot(x1 - x0, y1 - y0)
+            if dist >= min_gap or dist < 1e-6:
+                continue
+            ux, uy = (x1 - x0) / dist, (y1 - y0) / dist
+            mx, my = 0.5 * (x0 + x1), 0.5 * (y0 + y1)
+            half = min_gap / 2.0
+            pos[a] = (mx - ux * half, my - uy * half)
+            pos[b] = (mx + ux * half, my + uy * half)
+            moved = True
+        if not moved:
+            break
 
     return pos
 
@@ -739,7 +764,7 @@ minx, maxx = min(all_xs), max(all_xs)
 miny, maxy = min(all_ys), max(all_ys)
 # Marges plus larges en mode Schéma : toutes les gares sont nommées, il faut de
 # la place autour du dessin pour poser les étiquettes sans les tronquer.
-mfac = 0.14 if schema_mode else 0.08
+mfac = 0.18 if schema_mode else 0.08
 madd = SCHEMA_UNIT * 0.9 if schema_mode else 7000
 margin_x = (maxx - minx) * mfac + madd
 margin_y = (maxy - miny) * mfac + madd
@@ -1068,6 +1093,20 @@ def _label_dirs(sid, x, y):
         return [(-ux, -uy), (ux, uy)]
 
     dirs = []
+    if schema_mode:
+        # Alterne gauche / droite le long de la voie : les noms périurbains
+        # ne s'empilent plus tous du même côté.
+        parity = int(round((x * dx + y * dy) / (SCHEMA_UNIT * 0.9))) & 1
+        if parity:
+            dirs.extend(pair(-px, -py))
+            dirs.extend(pair(px, py))
+        else:
+            dirs.extend(pair(px, py))
+            dirs.extend(pair(-px, -py))
+        dirs.extend(pair(dx, dy))
+        dirs.extend(pair(px + dx, py + dy))
+        dirs.extend(pair(px - dx, py - dy))
+        return dirs
     dirs.extend(pair(px, py))
     dirs.extend(pair(dx, dy))
     dirs.extend(pair(px + dx, py + dy))
@@ -1095,7 +1134,7 @@ for sid in to_label:
     placed = None
     is_default = False
     # Plus de rayons candidats en mode Schéma : beaucoup plus d'étiquettes à caser.
-    max_r = 10 if schema_mode else 7
+    max_r = 14 if schema_mode else 7
     directions = _label_dirs(sid, x, y)
     for r in range(1, max_r):
         for di, (ux, uy) in enumerate(directions):
