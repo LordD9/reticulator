@@ -1,4 +1,4 @@
-# 🚄 Chronofer - Reticulator | Guide pour les Agents IA & Développeurs
+# 🚄 Chronofer - ReticuFer | Guide pour les Agents IA & Développeurs
 
 Ce fichier documente l'architecture, les frameworks, les conventions de style et les règles opérationnelles du sous-projet **Reticulator** au sein de l'écosystème **Chronofer**. Tous les futurs agents IA ou développeurs modifiant ce projet doivent se conformer à ces spécifications.
 

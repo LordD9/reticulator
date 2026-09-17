@@ -1,7 +1,14 @@
 # -*- coding: utf-8 -*-
 import json
 
-from missions_io import exporter_missions, importer_missions, mission_vide
+from missions_io import (
+    enregistrer_preset,
+    exporter_missions,
+    importer_missions,
+    lister_presets,
+    mission_vide,
+    slug_region,
+)
 
 
 def test_aller_retour_json():
@@ -38,3 +45,16 @@ def test_gares_hors_perimetre_filtrees():
     assert warns
     assert back[0]["steps"] == ["A"]
     assert "Z" not in back[0]["served_stations"]
+
+
+def test_slug_region_paca():
+    assert slug_region("Provence-Alpes-Côte d'Azur") == "provence-alpes-cote-d-azur"
+
+
+def test_preset_ecrit_et_liste(tmp_path):
+    ods = [mission_vide(i) for i in range(8)]
+    ods[0]["depart"] = "A"
+    path = enregistrer_preset(ods, "Provence-Alpes-Côte d'Azur", "cote bleue", root=tmp_path)
+    assert path.parent.name == "provence-alpes-cote-d-azur"
+    found = lister_presets("Provence-Alpes-Côte d'Azur", root=tmp_path)
+    assert path in found

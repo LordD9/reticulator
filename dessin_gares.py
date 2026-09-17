@@ -127,6 +127,20 @@ def contourne_obstacle(geom, obstacle, px, py, prefer_dx, prefer_dy, extra=0.0):
     return MultiLineString(parts)
 
 
+def wrap_nom_gare(nom, max_chars=16):
+    """Coupe un nom trop long en deux lignes (espace près du milieu)."""
+    nom = (nom or "").strip()
+    if len(nom) <= max_chars:
+        return nom
+    mid = len(nom) // 2
+    left = nom.rfind(" ", 0, max(mid + 4, min(len(nom), max_chars + 2)))
+    if left < 3:
+        left = nom.find(" ", mid)
+    if left < 3:
+        return nom[:mid].rstrip("-") + "\n" + nom[mid:].lstrip("-")
+    return nom[:left] + "\n" + nom[left + 1 :]
+
+
 def contourne_gare(geom, px, py, radius, prefer_dx, prefer_dy):
     """Contourne le disque (px, py, radius) du cote `prefer`, sans inverser."""
     if geom is None or geom.is_empty or radius <= 0:

@@ -16,10 +16,15 @@ import contextily as cx
 import math
 
 # Import depuis le script existant
-from branding import LOGO_PATH, composer_png_avec_logo
-from dessin_gares import capsule_polygon, contourne_obstacle
+from branding import LOGO_PATH, composer_pdf_depuis_png, composer_png_avec_logo
+from dessin_gares import capsule_polygon, contourne_obstacle, wrap_nom_gare
 from geo_view import folium_map_html
-from missions_io import exporter_missions, importer_missions
+from missions_io import (
+    enregistrer_preset,
+    exporter_missions,
+    importer_missions,
+    lister_presets,
+)
 from schema_reticulaire import (
     charger_donnees,
     construire_graphe,
@@ -50,7 +55,7 @@ MISSION_PALETTE = {
 }
 
 st.set_page_config(
-    page_title="Reticulator - Générateur Interactif",
+    page_title="ReticuFer — Générateur de schéma",
     layout="wide",
     page_icon=str(LOGO_PATH) if LOGO_PATH.is_file() else None,
 )
@@ -95,8 +100,8 @@ def load_and_build_graph(perimetre):
 # --- PERIMETRE GEOGRAPHIQUE ---
 # Choix du perimetre AVANT le chargement : conditionne les donnees mises en cache.
 if LOGO_PATH.is_file():
-    st.sidebar.image(str(LOGO_PATH), use_container_width=True)
-st.sidebar.title("Reticulator")
+    st.sidebar.image(str(LOGO_PATH), width=260)
+st.sidebar.title("ReticuFer")
 st.sidebar.subheader("🗺️ Périmètre géographique")
 _REGIONS = noms_regions()
 _DEFAUT_REGION = "Provence-Alpes-Côte d'Azur"
@@ -268,14 +273,24 @@ for i, od in enumerate(st.session_state.ods):
             unsafe_allow_html=True,
         )
 
-        c1, c2 = st.columns(2)
         idx_dep = [o[0] for o in station_options].index(od['depart']) + 1 if od['depart'] else 0
         idx_arr = [o[0] for o in station_options].index(od['arrivee']) + 1 if od['arrivee'] else 0
-        
-        dep = c1.selectbox(f"Origine", [None] + [o[0] for o in station_options], 
-                           format_func=format_station, index=idx_dep, key=f"dep_{i}")
-        arr = c2.selectbox(f"Destination", [None] + [o[0] for o in station_options], 
-                           format_func=format_station, index=idx_arr, key=f"arr_{i}")
+        dep = st.selectbox(
+            "Origine",
+            [None] + [o[0] for o in station_options],
+            format_func=format_station,
+            index=idx_dep,
+            key=f"dep_{i}",
+            placeholder="Rechercher une gare…",
+        )
+        arr = st.selectbox(
+            "Destination",
+            [None] + [o[0] for o in station_options],
+            format_func=format_station,
+            index=idx_arr,
+            key=f"arr_{i}",
+            placeholder="Rechercher une gare…",
+        )
         
         # Fréquence (trains par heure)
         freq = st.number_input("Fréquence (trains/heure)", min_value=0.1, max_value=20.0, value=float(od['freq_tph']), step=0.1, key=f"freq_{i}")
@@ -337,8 +352,13 @@ for i, od in enumerate(st.session_state.ods):
         else:
             st.caption("Aucune gare : insérez-les une à une pour bâtir le trajet.")
         add_g = st.selectbox(
-            "Gare à insérer", [None] + [o[0] for o in station_options],
-            format_func=format_station, index=0, key=f"addg_{i}")
+            "Gare à insérer",
+            [None] + [o[0] for o in station_options],
+            format_func=format_station,
+            index=0,
+            key=f"addg_{i}",
+            placeholder="Rechercher une gare…",
+        )
 
         pos_opts = list(range(len(od['steps']) + 1))
 
@@ -432,10 +452,41 @@ _payload = json.dumps(exporter_missions(st.session_state.ods), ensure_ascii=Fals
 st.sidebar.download_button(
     "Telecharger les 8 missions (JSON)",
     data=_payload.encode("utf-8"),
-    file_name="missions_reticulator.json",
+    file_name="missions_reticufer.json",
     mime="application/json",
     use_container_width=True,
 )
+_preset_nom = st.sidebar.text_input(
+    "Nom du preset (dossier missions/)",
+    value="",
+    placeholder="ex. cote-bleue",
+)
+if st.sidebar.button("Enregistrer dans missions/<region>/", use_container_width=True):
+    try:
+        _p = enregistrer_preset(st.session_state.ods, perimetre, _preset_nom or "missions")
+        st.sidebar.success(f"Preset : {_p.parent.name}/{_p.name}")
+    except OSError as _e:
+        st.sidebar.error(f"Écriture impossible : {_e}")
+_presets = lister_presets(perimetre)
+if _presets:
+    _choix_p = st.sidebar.selectbox(
+        "Preset de la région",
+        [None] + _presets,
+        format_func=lambda p: "—" if p is None else p.stem,
+        key="preset_region",
+    )
+    if _choix_p is not None and st.sidebar.button("Charger le preset", use_container_width=True):
+        try:
+            _ods, _warns = importer_missions(
+                _choix_p.read_text(encoding="utf-8"),
+                gares_connues=set(gares_dict.keys()),
+                couleurs_defaut=list(PALETTE_OD),
+            )
+            st.session_state.ods = _ods
+            st.session_state._missions_import_flash = (_warns, True)
+            st.rerun()
+        except Exception as _e:
+            st.sidebar.error(f"Preset illisible : {_e}")
 _up = st.sidebar.file_uploader(
     "Importer un fichier missions",
     type=["json"],
@@ -482,20 +533,18 @@ st.sidebar.caption(
     "Le zoom est interactif directement sur la carte : **molette** pour zoomer/"
     "dézoomer sous le curseur, **glisser** pour se déplacer."
 )
-fond_carte = "carto"
+fond_carte = "osm"
 if not schema_mode:
     _choix_fond = st.sidebar.radio(
         "Fond de carte",
-        ["Clair (Carto)", "Plan IGN"],
+        ["Clair (OSM)", "Plan IGN"],
         index=0,
-        help="Plan IGN via Géoplateforme, sans clé API. Commutable aussi dans la légende Leaflet.",
+        help="OSM et Plan IGN sans clé API. Commutable aussi dans la légende Leaflet.",
     )
-    fond_carte = "ign" if _choix_fond.startswith("Plan") else "carto"
+    fond_carte = "ign" if _choix_fond.startswith("Plan") else "osm"
 
 # --- GENERATION DE LA CARTE ---
-if LOGO_PATH.is_file():
-    st.image(str(LOGO_PATH), width=340)
-st.title("Générateur de Schéma Réticulaire")
+st.title("Générateur de schéma réticulaire")
 st.caption("Cerema — Chronofer / ReticuFer")
 st.markdown(
     "Ce tableau de bord permet de calculer et superposer jusqu'à 8 relations "
@@ -681,14 +730,14 @@ ax.axis('off')
 
 # Épaisseur du trait proportionnelle à la fréquence (en points), avec un
 # minimum lisible. Utilisée partout (tracé, passages, légende) pour rester cohérent.
-LW_PER_TPH = 4.0
+LW_PER_TPH = 6.0
 # Casing extérieur du faisceau (en points), dessiné SOUS les couleurs. Les
 # couleurs elles-mêmes sont jointives (pas de liseré blanc entre missions) :
 # le blanc n'apparaît que sur le pourtour du faisceau, plus sur les joints.
 CASING_PT = 0.9
 
 def freq_to_lw(freq):
-    return max(2.4, freq * LW_PER_TPH)
+    return max(3.6, freq * LW_PER_TPH)
 
 # 1. Identifier les tronçons partagés. L'ordre d'empilement est l'indice de
 #    mission (tri croissant) : il doit rester identique d'un tronçon au
@@ -830,7 +879,7 @@ for od in st.session_state.ods:
         if sid in drawn_stations:
             station_served_by.setdefault(sid, []).append(od['idx'])
 
-min_sq = meters_per_point * 8
+min_sq = meters_per_point * 4
 
 
 def station_axis(sid):
@@ -864,14 +913,18 @@ station_capsule = {}
 for sid in drawn_stations:
     if station_served_by.get(sid):
         side = max(min_sq, station_bundle.get(sid, 0.0) + meters_per_point * 2.5)
-        rad = side / 2.0
+        rad = side / 4.0
         station_radius[sid] = rad
         x, y = pos[sid]
         if len(station_served_by[sid]) == 1:
             station_obstacle[sid] = Point(x, y).buffer(rad)
         else:
             dx, dy = station_axis(sid)
-            cap = capsule_polygon(x, y, dx, dy, rad * 1.45, rad * 0.78)
+            px, py = -dy, dx
+            serving_w = sum(widths_by_od.get(idx, rad * 2) for idx in station_served_by[sid])
+            half_len = max(serving_w / 2.0, rad)
+            half_wid = rad
+            cap = capsule_polygon(x, y, px, py, half_len, half_wid)
             station_capsule[sid] = cap
             station_obstacle[sid] = cap
 
@@ -974,13 +1027,15 @@ for sid in drawn_stations:
             station_rects[sid] = (x - rad, y - rad, x + rad, y + rad)
             leaflet_stations.append({
                 "kind": "circle", "x": x, "y": y, "color": col,
-                "radius_px": 8, "nom": nom,
+                "radius_px": 4, "nom": nom,
             })
         else:
             cap = station_capsule.get(sid)
             if cap is None:
                 dx, dy = station_axis(sid)
-                cap = capsule_polygon(x, y, dx, dy, rad * 1.45, rad * 0.78)
+                px, py = -dy, dx
+                serving_w = sum(widths_by_od.get(idx, rad * 2) for idx in served)
+                cap = capsule_polygon(x, y, px, py, max(serving_w / 2.0, rad), rad)
             coords = list(cap.exterior.coords)
             poly = Polygon(coords, closed=True, facecolor='#FFFFFF', edgecolor='#111111',
                            linewidth=1.7, zorder=5, joinstyle='round')
@@ -1122,10 +1177,18 @@ for sid in to_label:
     else:
         fontsize = 10 if t == 'a' else 8
     fontweight = 'bold' if t == 'a' else 'normal'
-    nom = info['nom']
+    nom = wrap_nom_gare(info['nom'])
+    n_lines = nom.count("\n") + 1
+    longest = max(len(p) for p in nom.split("\n"))
+    dx_ax, dy_ax = station_axis(sid)
+    rotate = 0
+    if schema_mode and abs(dx_ax) >= abs(dy_ax) * 1.4:
+        rotate = 45
     # estimation de la taille du texte en mètres
-    text_w = max(1, len(nom)) * fontsize * 0.62 * meters_per_point
-    text_h = fontsize * 1.35 * meters_per_point
+    text_w = max(1, longest) * fontsize * 0.62 * meters_per_point
+    text_h = fontsize * 1.35 * n_lines * meters_per_point
+    if rotate:
+        text_w, text_h = (text_w + text_h) * 0.72, (text_w + text_h) * 0.72
     rx0, ry0, rx1, ry1 = station_rects[sid]
     half_rw = (rx1 - rx0) / 2
     half_rh = (ry1 - ry0) / 2
@@ -1204,6 +1267,7 @@ for sid in to_label:
                 zorder=6, clip_on=True)
     ax.text(cx_l, cy_l, nom, fontsize=fontsize, fontweight=fontweight,
             zorder=7, color='black', ha='center', va='center', clip_on=True,
+            rotation=rotate,
             bbox=dict(facecolor='white', alpha=0.82, edgecolor='none', boxstyle='round,pad=0.2'))
     occupied.append(bbox)
 
@@ -1211,11 +1275,10 @@ for sid in to_label:
 #     Schéma est volontairement dé-cartographié, sans fond géographique).
 if not schema_mode:
     try:
-        # Carto Positron exige désormais une clé API (tuiles « API KEY REQUIRED »).
-        # Esri WorldGrayCanvas offre un fond clair équivalent, sans clé ; repli OSM.
+        # OSM / Esri : sans clé. Carto Positron affiche « API KEY REQUIRED ».
         _basemap_ok = False
-        for _src in (cx.providers.Esri.WorldGrayCanvas,
-                     cx.providers.OpenStreetMap.Mapnik):
+        for _src in (cx.providers.OpenStreetMap.Mapnik,
+                     cx.providers.Esri.WorldGrayCanvas):
             try:
                 cx.add_basemap(ax, crs=CRS_METRIC, source=_src, alpha=0.5, zorder=0)
                 _basemap_ok = True
@@ -1356,21 +1419,30 @@ buf_leg = io.BytesIO()
 fig_legend.savefig(buf_leg, format="png", dpi=300, bbox_inches='tight', facecolor="white")
 png_map = composer_png_avec_logo(buf_map.getvalue())
 png_leg = composer_png_avec_logo(buf_leg.getvalue(), largeur_frac=0.55)
+pdf_map = composer_pdf_depuis_png(png_map)
 
-dl1, dl2 = st.columns(2)
+dl1, dl2, dl3 = st.columns(3)
 with dl1:
     st.download_button(
-        label="📥 Exporter la carte (PNG HD)",
+        label="📥 Carte (PNG HD)",
         data=png_map,
-        file_name="schema_reticulaire_carte.png",
+        file_name="schema_reticufer_carte.png",
         mime="image/png",
         use_container_width=True,
     )
 with dl2:
     st.download_button(
-        label="📥 Exporter la légende (PNG)",
+        label="📥 Légende (PNG)",
         data=png_leg,
-        file_name="schema_reticulaire_legende.png",
+        file_name="schema_reticufer_legende.png",
         mime="image/png",
+        use_container_width=True,
+    )
+with dl3:
+    st.download_button(
+        label="📥 Carte (PDF)",
+        data=pdf_map,
+        file_name="schema_reticufer_carte.pdf",
+        mime="application/pdf",
         use_container_width=True,
     )
