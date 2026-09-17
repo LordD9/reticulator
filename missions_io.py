@@ -1,10 +1,14 @@
 # -*- coding: utf-8 -*-
-"""Sauvegarde / import des 8 missions (JSON)."""
+"""Sauvegarde / import des 8 missions (JSON) et presets par région."""
 import json
+import re
+import unicodedata
+from pathlib import Path
 
 SCHEMA_VERSION = 1
 N_MISSIONS = 8
 _FIELDS = ("idx", "color", "depart", "arrivee", "steps", "served_stations", "freq_tph")
+MISSIONS_ROOT = Path(__file__).resolve().parent / "missions"
 
 
 def mission_vide(idx, color="#4E79A7"):
@@ -93,3 +97,38 @@ def importer_missions(payload, gares_connues=None, couleurs_defaut=None):
             "freq_tph": max(0.1, freq),
         }
     return ods, warns
+
+
+def slug_region(nom):
+    if not nom:
+        return "national"
+    raw = unicodedata.normalize("NFKD", str(nom))
+    raw = "".join(c for c in raw if not unicodedata.combining(c))
+    raw = re.sub(r"[^A-Za-z0-9]+", "-", raw).strip("-").lower()
+    return raw or "region"
+
+
+def dossier_presets(perimetre, root=None):
+    root = Path(root) if root is not None else MISSIONS_ROOT
+    if not perimetre or perimetre == "national":
+        return root / "national"
+    return root / slug_region(perimetre)
+
+
+def lister_presets(perimetre, root=None):
+    d = dossier_presets(perimetre, root)
+    if not d.is_dir():
+        return []
+    return sorted(p for p in d.glob("*.json") if p.is_file())
+
+
+def enregistrer_preset(ods, perimetre, nom, root=None):
+    d = dossier_presets(perimetre, root)
+    d.mkdir(parents=True, exist_ok=True)
+    slug = slug_region(nom) or "missions"
+    path = d / f"{slug}.json"
+    path.write_text(
+        json.dumps(exporter_missions(ods), ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    return path

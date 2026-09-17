@@ -3,7 +3,7 @@ import io
 
 from PIL import Image
 
-from branding import composer_png_avec_logo, LOGO_PATH
+from branding import composer_pdf_depuis_png, composer_png_avec_logo, LOGO_PATH
 
 
 def _png(w, h, color):
@@ -34,3 +34,9 @@ def test_logo_repo_existe_et_se_compose():
     im = Image.open(io.BytesIO(out))
     assert im.size[0] == 400
     assert im.size[1] > 200
+
+
+def test_pdf_une_page_depuis_png():
+    src = _png(80, 40, (240, 240, 240))
+    pdf = composer_pdf_depuis_png(src)
+    assert pdf[:4] == b"%PDF"

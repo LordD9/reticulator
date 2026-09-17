@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 from shapely.geometry import LineString, Point
 
-from dessin_gares import capsule_polygon, contourne_gare, contourne_obstacle
+from dessin_gares import capsule_polygon, contourne_gare, contourne_obstacle, wrap_nom_gare
 
 
 def test_capsule_allongee_selon_la_voie():
@@ -26,3 +26,13 @@ def test_contourne_capsule_sort_de_la_forme():
     apex_y = max(c[1] for c in out.coords)
     assert apex_y > 6
     assert not obs.contains(Point(0, apex_y))
+
+
+def test_wrap_nom_court_inchange():
+    assert wrap_nom_gare("Arles") == "Arles"
+
+
+def test_wrap_nom_long_deux_lignes():
+    out = wrap_nom_gare("Aix-en-Provence TGV", max_chars=12)
+    assert "\n" in out
+    assert out.replace("\n", " ") == "Aix-en-Provence TGV" or "Aix-en-Provence" in out

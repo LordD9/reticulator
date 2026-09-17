@@ -26,11 +26,12 @@ IGN_PLAN_URL = (
 IGN_ATTR = '&copy; <a href="https://www.ign.fr/">IGN</a> — Géoplateforme'
 
 
-def folium_map_html(tracks, stations, height=760, fond="carto"):
+def folium_map_html(tracks, stations, height=760, fond="osm"):
     """tracks: {xs, ys, color, weight}; stations: {kind, xs, ys, color, nom}.
 
-    fond: 'carto' (defaut, clair) ou 'ign' (Plan IGN, sans cle API).
+    fond: 'osm' (defaut, OpenStreetMap sans cle) ou 'ign' (Plan IGN, sans cle API).
     Les deux fonds restent commutables dans le controle de couches Leaflet.
+    Carto Positron n'est plus le defaut : il exige desormais une cle.
     """
     import folium
 
@@ -48,8 +49,8 @@ def folium_map_html(tracks, stations, height=760, fond="carto"):
         m = folium.Map(location=[lat, lon], zoom_start=9, tiles=None,
                        control_scale=True, scrollWheelZoom=True)
     folium.TileLayer(
-        tiles="CartoDB positron",
-        name="Clair (Carto)",
+        tiles="OpenStreetMap",
+        name="Clair (OSM)",
         show=(fond != "ign"),
         control=True,
     ).add_to(m)
@@ -90,7 +91,7 @@ def folium_map_html(tracks, stations, height=760, fond="carto"):
             continue
         folium.CircleMarker(
             latlons[0],
-            radius=max(6, float(s.get("radius_px", 8))),
+            radius=max(3, float(s.get("radius_px", 4))),
             color=s.get("color", "#4E79A7"),
             fill=True,
             fill_color=s.get("color", "#4E79A7"),
