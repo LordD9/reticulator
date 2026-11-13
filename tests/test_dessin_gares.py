@@ -36,3 +36,28 @@ def test_wrap_nom_long_deux_lignes():
     out = wrap_nom_gare("Aix-en-Provence TGV", max_chars=12)
     assert "\n" in out
     assert out.replace("\n", " ") == "Aix-en-Provence TGV" or "Aix-en-Provence" in out
+
+
+def test_rond_proportionnel_a_la_frequence():
+    from dessin_gares import emprise_gare
+    _t, r1, _ = emprise_gare([(0.0, 10.0)], 2.0)
+    _t, r4, _ = emprise_gare([(0.0, 40.0)], 2.0)
+    assert (r1, r4) == (7.0, 22.0)
+
+
+def test_capsule_couvre_les_traits_desservis():
+    from dessin_gares import emprise_gare
+    # orange (40) à gauche, bleu (10) à droite, jointifs : bords -40 et +10
+    t_c, hl, hw = emprise_gare([(-20.0, 40.0), (5.0, 10.0)], 2.0)
+    assert (t_c, hl, hw) == (-15.0, 27.0, 7.0)
+
+
+def test_coude_prolonge_le_tronc():
+    from dessin_gares import directions_alignees, trace_coude
+    # Tronc vertical A(0,0)-T(0,10) ; branche A -> B(5,10) : monter le long du
+    # tronc puis tourner, pas partir à l'horizontale depuis A.
+    pos = {"A": (0, 0), "T": (0, 10), "B": (5, 10)}
+    dirs = directions_alignees([("A", "T")], pos, 0.01)
+    assert trace_coude(pos["A"], pos["B"], dirs.get("A", set()), set(), 0.01) == [
+        (0, 0), (0, 10), (5, 10)]
+    assert trace_coude((0, 0), (5, 10), set(), set(), 0.01) == [(0, 0), (5, 0), (5, 10)]

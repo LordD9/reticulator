@@ -30,7 +30,8 @@ def capsule_polygon(x, y, dx, dy, half_len, half_wid):
         (x - dx * body - nx * half_wid, y - dy * body - ny * half_wid),
         (x - dx * body + nx * half_wid, y - dy * body + ny * half_wid),
     ])
-    return rect.union(Point(e1).buffer(half_wid)).union(Point(e2).buffer(half_wid))
+    return rect.union(Point(e1).buffer(half_wid, quad_segs=24)).union(
+        Point(e2).buffer(half_wid, quad_segs=24))
 
 
 def _apex_hors_obstacle(obstacle, px, py, pdx, pdy, extra=0.0):
@@ -120,6 +121,150 @@ def contourne_obstacle(geom, obstacle, px, py, prefer_dx, prefer_dy, extra=0.0):
             ng = _one(g)
             if ng is not None and not ng.is_empty:
                 parts.append(ng)
+    if not parts:
+        return geom
+    if len(parts) == 1:
+        return parts[0]
+    return MultiLineString(parts)
+
+
+def emprise_gare(traits, marge):
+    """Emprise d'un symbole de gare posé en travers des traits qui la desservent.
+
+    traits : [(t, w)] position latérale (le long de l'axe perpendiculaire à la
+    voie, relative au point gare) et largeur de chaque trait desservant.
+    marge : débord du symbole au-delà des traits.
+    Renvoie (t_centre, demi_long, demi_larg). Une seule mission : rond
+    (demi_long == demi_larg) de diamètre trait + 2 × marge : proportionnel à
+    la fréquence, il déborde juste du trait (le liseré blanc le détache).
+    Plusieurs : capsule qui couvre tout le faisceau desservi, aussi large
+    que le trait le plus fin plus la marge.
+    """
+    lo = min(t - w / 2.0 for t, w in traits)
+    hi = max(t + w / 2.0 for t, w in traits)
+    t_c = (lo + hi) / 2.0
+    if len(traits) == 1:
+        r = 0.5 * traits[0][1] + marge
+        return t_c, r, r
+    demi_long = (hi - lo) / 2.0 + marge
+    demi_larg = min(w for _t, w in traits) / 2.0 + marge
+    return t_c, max(demi_long, demi_larg), demi_larg
+
+
+def directions_alignees(segments, pos, eps):
+    """sid -> directions cardinales {(±1, 0), (0, ±1)} vers ses voisines
+    schématiques alignées (même X ou même Y)."""
+    dirs = {}
+    for a, b in segments:
+        if a not in pos or b not in pos:
+            continue
+        (xa, ya), (xb, yb) = pos[a], pos[b]
+        if abs(xa - xb) < eps and abs(ya - yb) >= eps:
+            d = (0, 1 if yb > ya else -1)
+        elif abs(ya - yb) < eps and abs(xa - xb) >= eps:
+            d = (1 if xb > xa else -1, 0)
+        else:
+            continue
+        dirs.setdefault(a, set()).add(d)
+        dirs.setdefault(b, set()).add((-d[0], -d[1]))
+    return dirs
+
+
+def _sens(v):
+    return 0 if v == 0 else (1 if v > 0 else -1)
+
+
+def trace_coude(pa, pb, dirs_a, dirs_b, eps):
+    """Tronçon schématique a -> b : droit si aligné, sinon un coude.
+
+    Le coude est placé pour que chaque branche prolonge un rail existant
+    (direction déjà prise par une voisine alignée) : une bifurcation suit le
+    tronc puis tourne, au lieu de quitter le faisceau dès la gare de départ
+    et de faire un décroché parallèle au tronc. À égalité : horizontal puis
+    vertical depuis a (comportement historique, déterministe).
+    """
+    (xa, ya), (xb, yb) = pa, pb
+    if abs(xa - xb) < eps or abs(ya - yb) < eps:
+        return [(xa, ya), (xb, yb)]
+    sx, sy = _sens(xb - xa), _sens(yb - ya)
+    h_dabord = int((sx, 0) in dirs_a) + int((0, -sy) in dirs_b)
+    v_dabord = int((0, sy) in dirs_a) + int((-sx, 0) in dirs_b)
+    if v_dabord > h_dabord:
+        return [(xa, ya), (xa, yb), (xb, yb)]
+    return [(xa, ya), (xb, ya), (xb, yb)]
+
+
+def offset_line(geom, offset, tol=None):
+    """Décale une LineString sans faire planter GEOS sur les tracés alpins.
+
+    ``offset_curve`` sur un tracé très sinueux (ex. Aix–Briançon) avec un
+    décalage de centaines de mètres peut lever ``GEOSException: cannot create
+    std::vector larger than max_size()``. On simplifie d'abord.
+
+    tol : tolérance de simplification. Elle doit être LA MÊME pour toutes les
+    missions d'un faisceau : sinon chaque mission décale un squelette
+    différent et des jours blancs apparaissent entre couleurs dans les
+    courbes. Par défaut dérivée du décalage (ancien comportement).
+    """
+    if geom is None or getattr(geom, "is_empty", True):
+        return geom
+    try:
+        off = float(offset)
+    except (TypeError, ValueError):
+        return geom
+    if not math.isfinite(off) or abs(off) < 1e-9:
+        return geom
+    if tol is None:
+        tol = max(25.0, min(abs(off) * 0.5, 250.0))
+
+    def _clean(ls):
+        coords = []
+        for x, y, *_rest in ls.coords:
+            if not (math.isfinite(x) and math.isfinite(y)):
+                continue
+            if coords and abs(x - coords[-1][0]) < 1e-6 and abs(y - coords[-1][1]) < 1e-6:
+                continue
+            coords.append((x, y))
+        if len(coords) < 2:
+            return None
+        out = LineString(coords)
+        if out.length <= 0:
+            return None
+        try:
+            simp = out.simplify(tol, preserve_topology=False)
+            if (simp is not None and not simp.is_empty
+                    and simp.geom_type == "LineString" and simp.length > 0):
+                out = simp
+        except Exception:
+            pass
+        return out
+
+    def _one(ls):
+        ls = _clean(ls)
+        if ls is None:
+            return None
+        try:
+            res = ls.offset_curve(off, join_style="round", quad_segs=4)
+        except Exception:
+            return ls
+        if res is None or res.is_empty:
+            return ls
+        return res
+
+    if geom.geom_type == "LineString":
+        src = [geom]
+    else:
+        src = [g for g in getattr(geom, "geoms", []) if g.geom_type == "LineString"]
+    parts = []
+    for p in src:
+        q = _one(p)
+        if q is None or q.is_empty:
+            continue
+        if q.geom_type == "LineString":
+            parts.append(q)
+        else:
+            parts.extend(g for g in getattr(q, "geoms", [])
+                         if g.geom_type == "LineString" and not g.is_empty)
     if not parts:
         return geom
     if len(parts) == 1:
