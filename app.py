@@ -12,7 +12,6 @@ from shapely.geometry import LineString, Point, box
 from shapely.ops import nearest_points
 from shapely.strtree import STRtree
 from shapely.affinity import translate
-import contextily as cx
 import math
 
 # Import depuis le script existant
@@ -1212,6 +1211,9 @@ for sid in to_label:
 if not schema_mode:
     try:
         _basemap_ok = False
+        # Import local : contextily tire rasterio, dont la roue exige
+        # libexpat (packages.txt). Sans lui, seul le fond de plan saute.
+        import contextily as cx
         for _src in fournisseurs_tuiles(fond_carte):
             try:
                 cx.add_basemap(ax, crs=CRS_METRIC, source=_src, alpha=0.5, zorder=0)
