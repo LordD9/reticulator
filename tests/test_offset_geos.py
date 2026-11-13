@@ -1,53 +1,7 @@
 """Regression: GEOS offset_curve must not crash on dense alpine-like polylines."""
-import math
 from shapely.geometry import LineString
 
-
-def offset_line(geom, offset):
-    # Mirror of app.offset_line (keep in sync).
-    if geom is None or getattr(geom, "is_empty", True):
-        return geom
-    off = float(offset)
-    if not math.isfinite(off) or abs(off) < 1e-9:
-        return geom
-
-    def _clean(ls):
-        coords = []
-        for x, y, *_rest in ls.coords:
-            if not (math.isfinite(x) and math.isfinite(y)):
-                continue
-            if coords and abs(x - coords[-1][0]) < 1e-6 and abs(y - coords[-1][1]) < 1e-6:
-                continue
-            coords.append((x, y))
-        if len(coords) < 2:
-            return None
-        out = LineString(coords)
-        if out.length <= 0:
-            return None
-        tol = max(25.0, min(abs(off) * 0.5, 250.0))
-        simp = out.simplify(tol, preserve_topology=False)
-        if (simp is not None and not simp.is_empty
-                and simp.geom_type == "LineString" and simp.length > 0):
-            out = simp
-        return out
-
-    def _one(ls):
-        ls = _clean(ls)
-        if ls is None:
-            return None
-        try:
-            try:
-                res = ls.offset_curve(off, join_style="mitre", mitre_limit=2.5)
-            except TypeError:
-                res = ls.offset_curve(off)
-        except Exception:
-            return ls
-        if res is None or res.is_empty:
-            return ls
-        return res
-
-    q = _one(geom)
-    return geom if q is None or q.is_empty else q
+from dessin_gares import offset_line
 
 
 def _switchback(n=400, span=80000.0, amp=800.0):
@@ -71,7 +25,13 @@ def test_zero_offset_is_identity():
     assert offset_line(geom, 0.0) is geom
 
 
-if __name__ == "__main__":
-    test_large_offset_does_not_raise()
-    test_zero_offset_is_identity()
-    print("ok")
+def test_tolerance_commune_traits_jointifs():
+    """Deux missions d'un faisceau décalées avec la même tolérance restent
+    jointives : la distance entre leurs traits égale la somme des demi-largeurs."""
+    geom = _switchback(n=60, span=30000.0, amp=300.0)
+    a = offset_line(geom, 50.0, tol=120.0)
+    b = offset_line(geom, -50.0, tol=120.0)
+    mid = geom.interpolate(0.5, normalized=True)
+    da, db = a.distance(mid), b.distance(mid)
+    assert abs((da + db) - 100.0) < 60.0
+    assert abs(a.hausdorff_distance(b) - 100.0) < 25.0

@@ -8,8 +8,8 @@ from matplotlib.patches import Circle, Polygon, Patch
 from matplotlib.lines import Line2D
 import networkx as nx
 import pandas as pd
-from shapely.geometry import LineString, MultiLineString, Point, box
-from shapely.ops import substring
+from shapely.geometry import LineString, Point, box
+from shapely.ops import nearest_points
 from shapely.strtree import STRtree
 from shapely.affinity import translate
 import contextily as cx
@@ -17,9 +17,19 @@ import math
 
 # Import depuis le script existant
 from branding import LOGO_PATH, composer_pdf_depuis_png, composer_png_avec_logo
-from dessin_gares import capsule_polygon, contourne_obstacle, wrap_nom_gare
-from geo_view import folium_map_html
+from dessin_gares import (
+    capsule_polygon,
+    contourne_obstacle,
+    directions_alignees,
+    emprise_gare,
+    offset_line,
+    trace_coude,
+    wrap_nom_gare,
+)
+from geo_view import folium_map_html, fournisseurs_tuiles
 from missions_io import (
+    N_MISSIONS,
+    mission_vide,
     enregistrer_preset,
     exporter_missions,
     importer_missions,
@@ -88,27 +98,38 @@ def load_and_build_graph(perimetre):
     
     for _, row in gares_metric.iterrows():
         uid = str(row['code_uic'])
+        # Position dessinée = projection de la gare sur la voie (celle du
+        # nœud du graphe, d'où partent les géométries d'arêtes). Le point
+        # brut du geojson est souvent le bâtiment voyageurs, à côté des voies.
+        snap = snap_info.get(uid)
+        x_m = snap["proj_x"] if snap else row.geometry.x
+        y_m = snap["proj_y"] if snap else row.geometry.y
         gares_dict[uid] = {
             'nom': row['nom_gare'],
             'type': str(row['type_gare']).lower(),
-            'x_m': row.geometry.x,
-            'y_m': row.geometry.y,
+            'x_m': x_m,
+            'y_m': y_m,
         }
             
     return gares_data, reseau_clip, station_graph, gares_dict, neighbors
 
-# --- PERIMETRE GEOGRAPHIQUE ---
-# Choix du perimetre AVANT le chargement : conditionne les donnees mises en cache.
+# --- BARRE LATÉRALE : périmètre, affichage, missions, sauvegarde ---
+# Ordre de lecture = ordre d'usage : où (périmètre), comment (affichage),
+# quoi (missions), puis sauvegarde. Le choix du périmètre précède le
+# chargement : il conditionne les données mises en cache.
 if LOGO_PATH.is_file():
-    st.sidebar.image(str(LOGO_PATH), width=260)
+    st.sidebar.image(str(LOGO_PATH), width=220)
 st.sidebar.title("ReticuFer")
-st.sidebar.subheader("🗺️ Périmètre géographique")
+
+st.sidebar.subheader("🗺️ Périmètre")
 _REGIONS = noms_regions()
 _DEFAUT_REGION = "Provence-Alpes-Côte d'Azur"
 mode_perimetre = st.sidebar.radio(
     "Gares prises en compte",
     ["Régional", "France entière"],
     index=0,
+    horizontal=True,
+    label_visibility="collapsed",
     help="Régional : gares du/des département(s) de la région choisie "
          "(regions_departements.json). France entière : toutes les gares de "
          "gare.geojson — le premier chargement du graphe national peut être long.",
@@ -116,9 +137,9 @@ mode_perimetre = st.sidebar.radio(
 if mode_perimetre == "France entière":
     perimetre = "national"
     st.sidebar.warning(
-        "Périmètre national : construction du graphe potentiellement longue et "
-        "gourmande en mémoire au premier chargement. Certaines gares peuvent "
-        "manquer au routage automatique — ajoutez-les à la main dans les missions."
+        "Périmètre national : premier chargement long et gourmand en mémoire. "
+        "Certaines gares peuvent manquer au routage automatique — ajoutez-les "
+        "à la main dans l'ajustement du trajet."
     )
 else:
     idx_def = _REGIONS.index(_DEFAUT_REGION) if _DEFAUT_REGION in _REGIONS else 0
@@ -136,230 +157,138 @@ except Exception as e:
 
 # --- INITIALISATION SESSION STATE ---
 if 'ods' not in st.session_state:
-    ods = []
-    for i in range(8):
-        ods.append({
-            'idx': i,
-            'color': PALETTE_OD[i],
-            'depart': None,
-            'arrivee': None,
-            'steps': [],
-            'served_stations': [],
-            'freq_tph': 1.0  # Fréquence en trains/heure
-        })
-    st.session_state.ods = ods
+    st.session_state.ods = [mission_vide(i, PALETTE_OD[i]) for i in range(N_MISSIONS)]
 
-# --- UI LATERALE ---
-st.sidebar.markdown("---")
-st.sidebar.subheader("🚄 Paramétrage des 8 OD")
+# Fonds de plan : Plan IGN par défaut (Géoplateforme, sans clé, pas de 403
+# comme les tuiles OSM pour les usages automatisés). OSM reste en option.
+FONDS = {"Plan IGN": "ign", "OpenStreetMap": "osm"}
+
+st.sidebar.subheader("🖼️ Affichage")
+_vue = st.sidebar.segmented_control(
+    "Rendu", ["Carte", "Schéma"], default="Carte", required=True,
+    key="vue_rendu",
+    help="Carte : tracés réels sur fond de plan. Schéma : angles droits, gares "
+         "alignées, espacement régularisé, toutes les gares nommées. L'affichage "
+         "ET l'export reprennent la vue choisie.",
+)
+schema_mode = _vue == "Schéma"
+fond_carte = "ign"
+if not schema_mode:
+    _choix_fond = st.sidebar.radio(
+        "Fond de plan", list(FONDS), index=0, horizontal=True,
+        help="Utilisé par la carte interactive ET par les exports PNG/PDF. "
+             "Commutable aussi dans le contrôle de couches de la carte.",
+    )
+    fond_carte = FONDS[_choix_fond]
 
 station_options = [(k, v['nom']) for k, v in gares_dict.items()]
 station_options.sort(key=lambda x: x[1])
+station_ids = [o[0] for o in station_options]
+
 
 def format_station(uic):
-    if not uic: return "Aucune"
+    if not uic:
+        return "Aucune"
     return gares_dict.get(uic, {}).get('nom', uic)
 
-def offset_line(geom, offset):
-    """Offset a LineString without crashing GEOS on dense alpine tracks.
 
-    ``offset_curve`` on a very wiggly LineString (ex. Aix–Briançon) with an
-    offset of hundreds of metres can raise
-    ``GEOSException: cannot create std::vector larger than max_size()``.
-    Simplify first, prefer mitre joins, and fall back to the original geom.
-    """
-    if geom is None or getattr(geom, 'is_empty', True):
-        return geom
-    try:
-        off = float(offset)
-    except (TypeError, ValueError):
-        return geom
-    if not math.isfinite(off) or abs(off) < 1e-9:
-        return geom
+def libelle_mission(od):
+    if len(od['steps']) < 2:
+        return f"{od['idx'] + 1} · (vide)"
+    return (f"{od['idx'] + 1} · {format_station(od['depart'])} ➔ "
+            f"{format_station(od['arrivee'])}")
 
-    def _clean(ls):
-        coords = []
-        for x, y, *_rest in ls.coords:
-            if not (math.isfinite(x) and math.isfinite(y)):
-                continue
-            if coords and abs(x - coords[-1][0]) < 1e-6 and abs(y - coords[-1][1]) < 1e-6:
-                continue
-            coords.append((x, y))
-        if len(coords) < 2:
-            return None
-        out = LineString(coords)
-        if out.length <= 0:
-            return None
-        # Tolerance in metres: enough to drop switchback spikes that explode GEOS.
-        tol = max(25.0, min(abs(off) * 0.5, 250.0))
-        try:
-            simp = out.simplify(tol, preserve_topology=False)
-            if (simp is not None and not simp.is_empty
-                    and simp.geom_type == 'LineString' and simp.length > 0):
-                out = simp
-        except Exception:
-            pass
-        return out
 
-    def _one(ls):
-        ls = _clean(ls)
-        if ls is None:
-            return None
-        try:
-            if hasattr(ls, 'offset_curve'):
-                try:
-                    res = ls.offset_curve(off, join_style='mitre', mitre_limit=2.5)
-                except TypeError:
-                    res = ls.offset_curve(off)
-            else:
-                side = 'left' if off > 0 else 'right'
-                res = ls.parallel_offset(abs(off), side)
-        except Exception:
-            return ls
-        if res is None or res.is_empty:
-            return ls
-        return res
-
-    parts = []
-    if geom.geom_type == 'LineString':
-        src = [geom]
+def _maj_extremites(od):
+    if od['steps']:
+        od['depart'], od['arrivee'] = od['steps'][0], od['steps'][-1]
     else:
-        src = [g for g in getattr(geom, 'geoms', []) if g.geom_type == 'LineString']
-    for p in src:
-        q = _one(p)
-        if q is None or q.is_empty:
-            continue
-        if q.geom_type == 'LineString':
-            parts.append(q)
-        else:
-            parts.extend(
-                g for g in getattr(q, 'geoms', [])
-                if g.geom_type == 'LineString' and not g.is_empty
-            )
-    if not parts:
-        return geom
-    if len(parts) == 1:
-        return parts[0]
-    return MultiLineString(parts)
+        od['depart'] = od['arrivee'] = None
 
-# Messages d'édition de trajet : affichés hors des expanders (repliés par défaut).
-for _i in range(len(st.session_state.ods)):
-    flash = st.session_state.pop(f"route_msg_{_i}", None)
-    if flash:
-        kind, text = flash
-        getattr(st.sidebar, kind)(f"Mission {_i + 1} : {text}")
 
-for i, od in enumerate(st.session_state.ods):
-    with st.sidebar.expander(f"Mission {i+1} - {format_station(od['depart'])} ➔ {format_station(od['arrivee'])}", expanded=False):
-        # --- Choix manuel de la couleur dans une palette ---
-        palette_names = list(MISSION_PALETTE.keys())
-        # Détermine la sélection courante : un nom de palette, sinon "Personnalisé…"
-        current_name = next((n for n, h in MISSION_PALETTE.items()
-                             if h.lower() == str(od['color']).lower()), "Personnalisé…")
-        choix = st.selectbox(
-            "Couleur de la mission",
-            palette_names + ["Personnalisé…"],
-            index=(palette_names + ["Personnalisé…"]).index(current_name),
-            key=f"palette_{i}",
-        )
+def editeur_mission(i, od):
+    """Formulaire d'une mission (rendu dans la barre latérale)."""
+    gen = st.session_state.get("gen_missions", 0)
+    palette_names = list(MISSION_PALETTE.keys())
+    opts_couleur = palette_names + ["Personnalisé…"]
+    current_name = next((n for n, h in MISSION_PALETTE.items()
+                         if h.lower() == str(od['color']).lower()), "Personnalisé…")
+    c1, c2 = st.columns([3, 2])
+    with c1:
+        choix = st.selectbox("Couleur", opts_couleur,
+                             index=opts_couleur.index(current_name), key=f"palette_{i}_{gen}")
+    with c2:
         if choix == "Personnalisé…":
-            od['color'] = st.color_picker(
-                "Teinte personnalisée", value=od['color'], key=f"color_{i}")
+            od['color'] = st.color_picker("Teinte", value=od['color'], key=f"color_{i}_{gen}")
         else:
             od['color'] = MISSION_PALETTE[choix]
-        st.markdown(
-            f"**Aperçu:** <span style='color:{od['color']};font-size:20px'>&#9608;</span> "
-            f"`{od['color']}`",
-            unsafe_allow_html=True,
-        )
+            st.markdown(
+                f"<div style='margin-top:30px;height:22px;border-radius:11px;"
+                f"background:{od['color']}'></div>",
+                unsafe_allow_html=True,
+            )
 
-        idx_dep = [o[0] for o in station_options].index(od['depart']) + 1 if od['depart'] else 0
-        idx_arr = [o[0] for o in station_options].index(od['arrivee']) + 1 if od['arrivee'] else 0
-        dep = st.selectbox(
-            "Origine",
-            [None] + [o[0] for o in station_options],
-            format_func=format_station,
-            index=idx_dep,
-            key=f"dep_{i}",
-            placeholder="Rechercher une gare…",
-        )
-        arr = st.selectbox(
-            "Destination",
-            [None] + [o[0] for o in station_options],
-            format_func=format_station,
-            index=idx_arr,
-            key=f"arr_{i}",
-            placeholder="Rechercher une gare…",
-        )
-        
-        # Fréquence (trains par heure)
-        freq = st.number_input("Fréquence (trains/heure)", min_value=0.1, max_value=20.0, value=float(od['freq_tph']), step=0.1, key=f"freq_{i}")
-        od['freq_tph'] = freq
+    idx_dep = station_ids.index(od['depart']) + 1 if od['depart'] in station_ids else 0
+    idx_arr = station_ids.index(od['arrivee']) + 1 if od['arrivee'] in station_ids else 0
+    dep = st.selectbox("Origine", [None] + station_ids, format_func=format_station,
+                       index=idx_dep, key=f"dep_{i}_{gen}", placeholder="Rechercher une gare…")
+    arr = st.selectbox("Destination", [None] + station_ids, format_func=format_station,
+                       index=idx_arr, key=f"arr_{i}_{gen}", placeholder="Rechercher une gare…")
+    od['freq_tph'] = st.number_input(
+        "Fréquence (trains/heure)", min_value=0.1, max_value=20.0,
+        value=float(od['freq_tph']), step=0.1, key=f"freq_{i}_{gen}",
+        help="Pilote l'épaisseur du trait et la taille des ronds de gare.")
 
-        if dep and arr and dep != arr:
-            if st.button(f"Calculer le trajet OD {i+1}", key=f"calc_{i}", use_container_width=True):
-                try:
-                    path = nx.shortest_path(station_graph, source=dep, target=arr, weight='weight')
-                    od['depart'] = dep
-                    od['arrivee'] = arr
-                    od['steps'] = path
-                    # Par défaut, toutes les gares du trajet sont desservies
-                    od['served_stations'] = path.copy()
-                    st.success("Trajet calculé avec succès.")
-                    st.rerun()
-                except nx.NodeNotFound:
-                    st.error(
-                        "Gare isolée sur le réseau (non reliée par le graphe). "
-                        "Construisez le trajet à la main via l'ajustement manuel "
-                        "ci-dessous."
-                    )
-                except nx.NetworkXNoPath:
-                    st.error("Aucun chemin trouvé sur le réseau actuel.")
-        
-        if len(od['steps']) > 0:
-            if st.button(f"🗑️ Effacer la mission {i+1}", key=f"clear_{i}", use_container_width=True):
-                od['depart'] = None
-                od['arrivee'] = None
-                od['steps'] = []
-                od['served_stations'] = []
-                st.rerun()
+    b1, b2 = st.columns(2)
+    with b1:
+        calc = st.button("Calculer", key=f"calc_{i}_{gen}", type="primary",
+                         use_container_width=True,
+                         disabled=not (dep and arr and dep != arr))
+    with b2:
+        effacer = st.button("Effacer", key=f"clear_{i}_{gen}", use_container_width=True,
+                            disabled=not od['steps'])
+    if calc:
+        try:
+            path = nx.shortest_path(station_graph, source=dep, target=arr, weight='weight')
+            od['steps'] = path
+            od['served_stations'] = path.copy()  # tout desservi par défaut
+            _maj_extremites(od)
+            st.session_state[f"route_msg_{i}"] = ("success", "Trajet calculé.")
+            st.rerun()
+        except nx.NodeNotFound:
+            st.error("Gare isolée sur le réseau (non reliée par le graphe). "
+                     "Construisez le trajet à la main via l'ajustement ci-dessous.")
+        except nx.NetworkXNoPath:
+            st.error("Aucun chemin trouvé sur le réseau actuel.")
+    if effacer:
+        od['steps'], od['served_stations'] = [], []
+        _maj_extremites(od)
+        st.rerun()
 
-            # Sélection des gares spécifiquement desservies
-            # La clé dépend du trajet : après insertion/retrait (recolle réseau)
-            # Streamlit ignore `default` si le widget existe déjà.
-            _sk = "|".join(od['steps'])
-            served = st.multiselect(
+    if od['steps']:
+        # La clé dépend du trajet : après insertion/retrait (recollage réseau)
+        # Streamlit ignorerait `default` si le widget existait déjà.
+        _sk = "|".join(od['steps'])
+        with st.expander(f"Desserte ({len(od['served_stations'])}/{len(od['steps'])} gares)",
+                         expanded=False):
+            od['served_stations'] = st.multiselect(
                 "Gares desservies (décocher = passage sans arrêt)",
                 options=od['steps'],
                 default=[s for s in od['served_stations'] if s in od['steps']],
                 format_func=format_station,
-                key=f"served_{i}_{_sk}"
+                key=f"served_{i}_{gen}_{_sk}",
             )
-            od['served_stations'] = served
 
-        # --- Ajustement manuel du trajet (toujours disponible) ---
-        # Le plus court chemin peut emprunter le mauvais embranchement : on
-        # insère/retire des gares, et chaque édition recolle le trajet sur le
-        # graphe (gares intermédiaires du réseau, géométrie des voies).
-        st.markdown("**✏️ Ajustement manuel du trajet**")
-        st.caption(
-            "À une bifurcation, retirez les gares du mauvais embranchement et "
-            "insérez celles du bon : le tracé est recollé sur le réseau existant."
-        )
+    # Ajustement manuel : le plus court chemin peut prendre le mauvais
+    # embranchement. Chaque édition recolle le trajet sur le graphe.
+    with st.expander("✏️ Ajuster le trajet", expanded=not od['steps']):
         if od['steps']:
-            st.caption("Ordre actuel : " +
-                       " → ".join(format_station(s) for s in od['steps']))
+            st.caption("Ordre actuel : " + " → ".join(format_station(s) for s in od['steps']))
         else:
             st.caption("Aucune gare : insérez-les une à une pour bâtir le trajet.")
-        add_g = st.selectbox(
-            "Gare à insérer",
-            [None] + [o[0] for o in station_options],
-            format_func=format_station,
-            index=0,
-            key=f"addg_{i}",
-            placeholder="Rechercher une gare…",
-        )
-
+        add_g = st.selectbox("Gare à insérer", [None] + station_ids,
+                             format_func=format_station, index=0, key=f"addg_{i}_{gen}",
+                             placeholder="Rechercher une gare…")
         pos_opts = list(range(len(od['steps']) + 1))
 
         def _fmt_pos(k, _steps=list(od['steps'])):
@@ -369,195 +298,160 @@ for i, od in enumerate(st.session_state.ods):
                 return f"En tête (avant {format_station(_steps[0])})"
             if k == len(_steps):
                 return f"En queue (après {format_station(_steps[-1])})"
-            return (f"Entre {format_station(_steps[k-1])} "
-                    f"et {format_station(_steps[k])}")
+            return f"Entre {format_station(_steps[k-1])} et {format_station(_steps[k])}"
 
-        ins_pos = st.selectbox("Position d'insertion", pos_opts,
-                               index=len(od['steps']), format_func=_fmt_pos,
-                               key=f"addpos_{i}")
-        if st.button("➕ Insérer la gare", key=f"addbtn_{i}", use_container_width=True):
-            if not add_g:
-                st.warning("Choisissez une gare à insérer.")
-            elif add_g in od['steps']:
+        ins_pos = st.selectbox("Position", pos_opts, index=len(od['steps']),
+                               format_func=_fmt_pos, key=f"addpos_{i}_{gen}")
+        if st.button("➕ Insérer", key=f"addbtn_{i}_{gen}", use_container_width=True,
+                     disabled=not add_g):
+            if add_g in od['steps']:
                 st.warning("Cette gare est déjà présente dans le trajet.")
             else:
                 old_steps = list(od['steps'])
-                new_steps, ok = inserer_gare_sur_reseau(
-                    station_graph, od['steps'], add_g, ins_pos)
+                new_steps, ok = inserer_gare_sur_reseau(station_graph, od['steps'], add_g, ins_pos)
                 od['steps'] = new_steps
-                # Conserver le statut « desservie » des gares qui restent ;
-                # les gares nouvellement injectées par le graphe sont desservies
-                # par défaut (l'utilisateur peut les décocher).
+                # Statut « desservie » conservé ; les gares injectées par le
+                # graphe sont desservies par défaut.
                 kept = [s for s in od['served_stations'] if s in new_steps]
                 added = [s for s in new_steps if s not in old_steps]
                 od['served_stations'] = kept + [s for s in added if s not in kept]
-                if od['steps']:
-                    od['depart'] = od['steps'][0]
-                    od['arrivee'] = od['steps'][-1]
+                _maj_extremites(od)
                 if ok:
-                    n_add = len(added)
-                    extra = (f" {n_add} gare(s) du réseau ajoutée(s) sur le trajet."
-                             if n_add > 1 else "")
+                    extra = (f" {len(added)} gare(s) du réseau ajoutée(s)."
+                             if len(added) > 1 else "")
                     st.session_state[f"route_msg_{i}"] = (
-                        "success",
-                        "Gare insérée, tracé recollé sur le réseau." + extra,
-                    )
+                        "success", "Gare insérée, tracé recollé sur le réseau." + extra)
                 else:
                     st.session_state[f"route_msg_{i}"] = (
                         "warning",
-                        "Gare insérée, mais aucun itinéraire réseau n'a été trouvé "
-                        "de part et d'autre : le tronçon est tracé en ligne droite. "
-                        "Insérez une gare intermédiaire pour recoller aux voies.",
-                    )
+                        "Gare insérée sans itinéraire réseau : tronçon en ligne droite. "
+                        "Insérez une gare intermédiaire pour recoller aux voies.")
                 st.rerun()
 
         if od['steps']:
-            rem_g = st.selectbox(
-                "Retirer une gare du trajet", [None] + list(od['steps']),
-                format_func=format_station, index=0, key=f"remg_{i}")
-            if st.button("➖ Retirer la gare", key=f"rembtn_{i}", use_container_width=True):
-                if rem_g:
-                    old_steps = list(od['steps'])
-                    new_steps, ok = retirer_gare_sur_reseau(
-                        station_graph, od['steps'], rem_g)
-                    od['steps'] = new_steps
-                    kept = [s for s in od['served_stations'] if s in new_steps]
-                    added = [s for s in new_steps if s not in old_steps]
-                    od['served_stations'] = kept + [s for s in added if s not in kept]
-                    if od['steps']:
-                        od['depart'] = od['steps'][0]
-                        od['arrivee'] = od['steps'][-1]
-                    else:
-                        od['depart'] = None
-                        od['arrivee'] = None
-                    if ok:
-                        st.session_state[f"route_msg_{i}"] = (
-                            "success",
-                            "Gare retirée, tracé recollé sur le réseau "
-                            "(l'embranchement retiré n'est pas réintroduit).",
-                        )
-                    else:
-                        st.session_state[f"route_msg_{i}"] = (
-                            "warning",
-                            "Gare retirée, mais aucun itinéraire réseau alternatif "
-                            "n'a été trouvé : le tronçon restant est en ligne droite. "
-                            "Insérez la gare du bon embranchement pour recoller.",
-                        )
-                    st.rerun()
+            rem_g = st.selectbox("Gare à retirer", [None] + list(od['steps']),
+                                 format_func=format_station, index=0, key=f"remg_{i}_{gen}")
+            if st.button("➖ Retirer", key=f"rembtn_{i}_{gen}", use_container_width=True,
+                         disabled=not rem_g):
+                old_steps = list(od['steps'])
+                new_steps, ok = retirer_gare_sur_reseau(station_graph, od['steps'], rem_g)
+                od['steps'] = new_steps
+                kept = [s for s in od['served_stations'] if s in new_steps]
+                added = [s for s in new_steps if s not in old_steps]
+                od['served_stations'] = kept + [s for s in added if s not in kept]
+                _maj_extremites(od)
+                if ok:
+                    st.session_state[f"route_msg_{i}"] = (
+                        "success", "Gare retirée, tracé recollé (embranchement non réintroduit).")
+                else:
+                    st.session_state[f"route_msg_{i}"] = (
+                        "warning",
+                        "Gare retirée sans itinéraire alternatif : tronçon en ligne droite. "
+                        "Insérez la gare du bon embranchement pour recoller.")
+                st.rerun()
+
+
+def remplacer_missions(ods, warns):
+    """Remplace les missions (import / preset). Les widgets d'édition gardent
+    sinon leur ancien état et réécrivent couleur et fréquence de la mission
+    affichée par-dessus les valeurs importées : on change de génération de
+    clés de widgets."""
+    st.session_state.gen_missions = st.session_state.get("gen_missions", 0) + 1
+    st.session_state.ods = ods
+    st.session_state._missions_import_flash = (warns, True)
+    st.rerun()
+
+
+st.sidebar.subheader(f"🚄 Missions ({N_MISSIONS} max)")
+# Une seule mission éditée à la fois : plus de pile de 8 volets à ouvrir.
+active = st.sidebar.selectbox(
+    "Mission à éditer", list(range(len(st.session_state.ods))),
+    format_func=lambda k: libelle_mission(st.session_state.ods[k]),
+    key=f"mission_active_{st.session_state.get('gen_missions', 0)}",
+)
+for _i in range(len(st.session_state.ods)):
+    flash = st.session_state.pop(f"route_msg_{_i}", None)
+    if flash:
+        kind, text = flash
+        getattr(st.sidebar, kind)(f"Mission {_i + 1} : {text}")
+with st.sidebar:
+    editeur_mission(active, st.session_state.ods[active])
 
 # --- Sauvegarde / import des missions ---
-st.sidebar.markdown("---")
-st.sidebar.subheader("Sauvegarde des missions")
-_payload = json.dumps(exporter_missions(st.session_state.ods), ensure_ascii=False, indent=2)
-st.sidebar.download_button(
-    "Telecharger les 8 missions (JSON)",
-    data=_payload.encode("utf-8"),
-    file_name="missions_reticufer.json",
-    mime="application/json",
-    use_container_width=True,
-)
-_preset_nom = st.sidebar.text_input(
-    "Nom du preset (dossier missions/)",
-    value="",
-    placeholder="ex. cote-bleue",
-)
-if st.sidebar.button("Enregistrer dans missions/<region>/", use_container_width=True):
-    try:
-        _p = enregistrer_preset(st.session_state.ods, perimetre, _preset_nom or "missions")
-        st.sidebar.success(f"Preset : {_p.parent.name}/{_p.name}")
-    except OSError as _e:
-        st.sidebar.error(f"Écriture impossible : {_e}")
-_presets = lister_presets(perimetre)
-if _presets:
-    _choix_p = st.sidebar.selectbox(
-        "Preset de la région",
-        [None] + _presets,
-        format_func=lambda p: "—" if p is None else p.stem,
-        key="preset_region",
+with st.sidebar.expander("💾 Sauvegarde et import", expanded=False):
+    _payload = json.dumps(exporter_missions(st.session_state.ods), ensure_ascii=False, indent=2)
+    st.download_button(
+        "Télécharger les missions (JSON)",
+        data=_payload.encode("utf-8"),
+        file_name="missions_reticufer.json",
+        mime="application/json",
+        use_container_width=True,
     )
-    if _choix_p is not None and st.sidebar.button("Charger le preset", use_container_width=True):
+    _preset_nom = st.text_input("Nom du preset (dossier missions/)", value="",
+                                placeholder="ex. cote-bleue")
+    if st.button("Enregistrer dans missions/<région>/", use_container_width=True):
         try:
-            _ods, _warns = importer_missions(
-                _choix_p.read_text(encoding="utf-8"),
-                gares_connues=set(gares_dict.keys()),
-                couleurs_defaut=list(PALETTE_OD),
-            )
-            st.session_state.ods = _ods
-            st.session_state._missions_import_flash = (_warns, True)
-            st.rerun()
-        except Exception as _e:
-            st.sidebar.error(f"Preset illisible : {_e}")
-_up = st.sidebar.file_uploader(
-    "Importer un fichier missions",
-    type=["json"],
-    help="Remplace les 8 missions. Les gares hors perimetre actuel sont ignorees.",
-)
-if _up is not None:
-    _raw = _up.getvalue()
-    _sig = hash(_raw)
-    if st.session_state.get("_missions_import_sig") != _sig:
-        try:
-            _ods, _warns = importer_missions(
-                _raw, gares_connues=set(gares_dict.keys()), couleurs_defaut=list(PALETTE_OD),
-            )
-            st.session_state.ods = _ods
-            st.session_state._missions_import_sig = _sig
-            st.session_state._missions_import_flash = (_warns, True)
-            st.rerun()
-        except Exception as _e:
-            st.sidebar.error(f"Import impossible : {_e}")
+            _p = enregistrer_preset(st.session_state.ods, perimetre, _preset_nom or "missions")
+            st.success(f"Preset : {_p.parent.name}/{_p.name}")
+        except OSError as _e:
+            st.error(f"Écriture impossible : {_e}")
+    _presets = lister_presets(perimetre)
+    if _presets:
+        _choix_p = st.selectbox("Preset de la région", [None] + _presets,
+                                format_func=lambda p: "—" if p is None else p.stem,
+                                key="preset_region")
+        if _choix_p is not None and st.button("Charger le preset", use_container_width=True):
+            try:
+                _ods, _warns = importer_missions(
+                    _choix_p.read_text(encoding="utf-8"),
+                    gares_connues=set(gares_dict.keys()),
+                    couleurs_defaut=list(PALETTE_OD),
+                )
+            except Exception as _e:
+                st.error(f"Preset illisible : {_e}")
+            else:
+                remplacer_missions(_ods, _warns)
+    _up = st.file_uploader("Importer un fichier missions", type=["json"],
+                           help="Remplace les missions. Les gares hors périmètre "
+                                "actuel sont ignorées.")
+    if _up is not None:
+        _raw = _up.getvalue()
+        _sig = hash(_raw)
+        if st.session_state.get("_missions_import_sig") != _sig:
+            try:
+                _ods, _warns = importer_missions(
+                    _raw, gares_connues=set(gares_dict.keys()),
+                    couleurs_defaut=list(PALETTE_OD),
+                )
+            except Exception as _e:
+                st.error(f"Import impossible : {_e}")
+            else:
+                st.session_state._missions_import_sig = _sig
+                remplacer_missions(_ods, _warns)
 
 _flash = st.session_state.pop("_missions_import_flash", None)
 if _flash:
     _warns, _ok = _flash
     if _ok:
-        st.sidebar.success("Missions importees.")
+        st.sidebar.success("Missions importées.")
     for _w in _warns:
         st.sidebar.warning(_w)
 
-# --- MODE D'AFFICHAGE ---
-st.sidebar.markdown("---")
-st.sidebar.subheader("🖼️ Mode d'affichage")
-schema_mode = st.sidebar.checkbox(
-    "Mode Schéma (représentation simplifiée)", value=False,
-    help="Remplace le rendu cartographique (fond OSM + tracés réels) par un schéma "
-         "épuré : tracés à angles droits (nord/sud/est/ouest uniquement), gares "
-         "alignées tant que la direction ne change pas, espacement régularisé, et "
-         "toutes les gares nommées. L'affichage ET l'export reprennent cette version.",
-)
-
-# --- CADRAGE / ZOOM ---
-st.sidebar.markdown("---")
-st.sidebar.subheader("🔍 Cadrage de la carte")
-st.sidebar.caption(
-    "Le zoom est interactif directement sur la carte : **molette** pour zoomer/"
-    "dézoomer sous le curseur, **glisser** pour se déplacer."
-)
-fond_carte = "osm"
-if not schema_mode:
-    _choix_fond = st.sidebar.radio(
-        "Fond de carte",
-        ["Clair (OSM)", "Plan IGN"],
-        index=0,
-        help="OSM et Plan IGN sans clé API. Commutable aussi dans la légende Leaflet.",
-    )
-    fond_carte = "ign" if _choix_fond.startswith("Plan") else "osm"
-
-# --- GENERATION DE LA CARTE ---
+# --- ZONE PRINCIPALE ---
 st.title("Générateur de schéma réticulaire")
-st.caption("Cerema — Chronofer / ReticuFer")
-st.markdown(
-    "Ce tableau de bord permet de calculer et superposer jusqu'à 8 relations "
-    "ferroviaires. Les traits se décalent automatiquement s'ils partagent les "
-    "mêmes voies (offset). **Une gare desservie par une seule mission prend la "
-    "couleur de cette mission ; une correspondance (plusieurs missions) est une "
-    "capsule blanche type RATP.** Si une gare est décochée (passage sans arrêt), "
-    "le trait contourne le symbole, toujours du même côté. L'épaisseur des traits est "
-    "proportionnelle à la fréquence ; sur un même faisceau les couleurs sont "
-    "jointives, dans un ordre constant."
-)
-if schema_mode:
-    st.info("Mode Schema actif : angles droits, longs sauts tasses, periurbain ecarte, tous les noms sans chevauchement. Export identique.")
+st.caption("Cerema — Chronofer / ReticuFer · "
+           + ("vue schéma" if schema_mode else f"vue carte, fond {_choix_fond}"))
+with st.expander("Comment lire le schéma ?", expanded=False):
+    st.markdown(
+        "- Jusqu'à 8 missions superposées ; sur un même faisceau les couleurs "
+        "sont **jointives**, dans un ordre constant.\n"
+        "- **Épaisseur du trait et taille du rond ∝ fréquence.**\n"
+        "- Gare desservie par **une** mission : rond de sa couleur. "
+        "**Correspondance** (plusieurs missions) : capsule blanche type RATP.\n"
+        "- Passage sans arrêt : le trait contourne le symbole, toujours du même côté.\n"
+        "- Carte interactive : molette = zoom, traits et gares gardent leur taille."
+    )
+toolbar = st.container()
 
 # Espacement schématique de référence (unités ~métriques pour rester cohérent
 # avec les marges et conversions mètres<->points existantes).
@@ -566,17 +460,12 @@ SCHEMA_UNIT = 12000.0
 
 def schematic_edge_geom(a, b):
     """Tronçon schématique entre deux gares : segment droit si elles partagent une
-    ligne (même X ou même Y), sinon un coude à angle droit (horizontal puis
-    vertical). Déterministe pour une paire canonique donnée -> les tronçons
-    partagés restent superposables et décalables (offset)."""
-    xa, ya = pos[a]
-    xb, yb = pos[b]
+    ligne (même X ou même Y), sinon un coude à angle droit qui prolonge les
+    rails existants (voir `trace_coude`). Déterministe pour une paire
+    canonique donnée -> les tronçons partagés restent superposables."""
     eps = SCHEMA_UNIT * 1e-3
-    if abs(xa - xb) < eps or abs(ya - yb) < eps:
-        coords = [(xa, ya), (xb, yb)]
-    else:
-        coords = [(xa, ya), (xb, ya), (xb, yb)]  # coude à angle droit
-    return LineString(coords)
+    return LineString(trace_coude(pos[a], pos[b], schema_dirs.get(a, set()),
+                                  schema_dirs.get(b, set()), eps))
 
 
 def get_edge_geom(u, v):
@@ -719,9 +608,15 @@ def oriented_offset(geom, canonical, od_idx):
     off = segment_offsets.get((canonical, od_idx), 0.0)
     off = off * segment_sign.get(canonical, 1.0)
     try:
-        return offset_line(geom, off)
+        return offset_line(geom, off, tol=tol_simplif(canonical))
     except Exception:
         return geom
+
+
+def tol_simplif(canonical):
+    """Tolérance de simplification commune à tout le faisceau d'un tronçon :
+    chaque mission décale le même squelette -> traits jointifs dans les courbes."""
+    return max(25.0, min(segment_width_m.get(canonical, 0.0) * 0.25, 2000.0))
 
 
 fig, ax = plt.subplots(figsize=(16, 12))
@@ -771,6 +666,10 @@ if schema_mode and drawn_stations:
     pos = compute_schematic_layout(drawn_stations, list(segment_users.keys()), gares_dict)
 else:
     pos = {sid: (gares_dict[sid]['x_m'], gares_dict[sid]['y_m']) for sid in drawn_stations}
+# Directions de rail déjà prises par chaque gare (mode schéma) : les coudes
+# prolongent ces rails au lieu de créer un décroché parallèle.
+schema_dirs = (directions_alignees(segment_users.keys(), pos, SCHEMA_UNIT * 1e-3)
+               if schema_mode else {})
 
 all_xs = [pos[s][0] for s in drawn_stations]
 all_ys = [pos[s][1] for s in drawn_stations]
@@ -867,11 +766,9 @@ def _line_parts(geom):
 # Missions qui DESSERVENT une gare (un passage sans arrêt ne compte pas).
 station_served_by = {}
 incident_segments = {}
-station_bundle = {}
 for canonical in segment_users:
     for sid in canonical:
         incident_segments.setdefault(sid, []).append(canonical)
-        station_bundle[sid] = max(station_bundle.get(sid, 0.0), segment_width_m[canonical])
 for od in st.session_state.ods:
     if len(od['steps']) < 2:
         continue
@@ -880,6 +777,8 @@ for od in st.session_state.ods:
             station_served_by.setdefault(sid, []).append(od['idx'])
 
 min_sq = meters_per_point * 4
+# Débord du symbole de gare au-delà des traits qu'il couvre (points).
+MARGE_GARE_PT = 2.2
 
 
 def station_axis(sid):
@@ -907,26 +806,61 @@ def station_axis(sid):
     return best_dir
 
 
-station_radius = {}
+# 6a. Géométries décalées, avant contournement : les symboles de gare se
+#     posent sur les traits réellement dessinés, pas sur le point gare.
+shifted = {}
+for canonical_edge, raw_users in segment_users.items():
+    geom = get_edge_geom(canonical_edge[0], canonical_edge[1])
+    for od_idx in sorted(raw_users):
+        g = oriented_offset(geom, canonical_edge, od_idx)
+        if g is not None and not g.is_empty:
+            shifted[(canonical_edge, od_idx)] = g
+
+
+def position_laterale(sid, od_idx, px, py):
+    """Écart signé (le long de la perpendiculaire) entre la gare et le trait
+    décalé de la mission `od_idx` à son droit."""
+    x, y = pos[sid]
+    p = Point(x, y)
+    best = None
+    for canonical in incident_segments.get(sid, []):
+        g = shifted.get((canonical, od_idx))
+        if g is None:
+            continue
+        d = g.distance(p)
+        if best is None or d < best[0]:
+            best = (d, nearest_points(g, p)[0])
+    if best is None:
+        return 0.0
+    q = best[1]
+    return (q.x - x) * px + (q.y - y) * py
+
+
+# 6b. Symboles : une mission -> rond ∝ fréquence ; plusieurs -> capsule qui
+#     couvre exactement les traits desservis (pas un ovale centré à côté).
+station_symbol = {}
 station_obstacle = {}
-station_capsule = {}
+marge_gare = MARGE_GARE_PT * meters_per_point
 for sid in drawn_stations:
-    if station_served_by.get(sid):
-        side = max(min_sq, station_bundle.get(sid, 0.0) + meters_per_point * 2.5)
-        rad = side / 4.0
-        station_radius[sid] = rad
-        x, y = pos[sid]
-        if len(station_served_by[sid]) == 1:
-            station_obstacle[sid] = Point(x, y).buffer(rad)
-        else:
-            dx, dy = station_axis(sid)
-            px, py = -dy, dx
-            serving_w = sum(widths_by_od.get(idx, rad * 2) for idx in station_served_by[sid])
-            half_len = max(serving_w / 2.0, rad)
-            half_wid = rad
-            cap = capsule_polygon(x, y, px, py, half_len, half_wid)
-            station_capsule[sid] = cap
-            station_obstacle[sid] = cap
+    served = station_served_by.get(sid)
+    if not served:
+        continue
+    x, y = pos[sid]
+    dx, dy = station_axis(sid)
+    px, py = -dy, dx
+    traits = [(position_laterale(sid, idx, px, py), widths_by_od.get(idx, min_sq))
+              for idx in served]
+    t_c, hl, hw = emprise_gare(traits, marge_gare)
+    cx_s, cy_s = x + px * t_c, y + py * t_c
+    if len(served) == 1:
+        shape = Point(cx_s, cy_s).buffer(hl, quad_segs=24)
+    else:
+        shape = capsule_polygon(cx_s, cy_s, px, py, hl, hw)
+    station_symbol[sid] = {
+        "shape": shape, "x": cx_s, "y": cy_s, "perp": (px, py),
+        "t_m": t_c, "hl_m": hl, "hw_m": hw,
+    }
+    station_obstacle[sid] = shape
 
 
 def skip_prefer_vec(canonical, od_idx, geom):
@@ -966,21 +900,21 @@ def skip_prefer_vec(canonical, od_idx, geom):
     return left
 
 
-# 6. Lignes de mission : casing blanc sous le faisceau (z=3), couleurs jointives
-#    (z=4), sans path_effects. Le blanc ne reste visible que sur le pourtour.
+# 6c. Lignes de mission : casing blanc sous le faisceau (z=3), couleurs jointives
+#     (z=4), sans path_effects. Le blanc ne reste visible que sur le pourtour.
+#     La carte Leaflet reçoit la géométrie NON décalée + l'offset en points :
+#     le décalage est refait en pixels à chaque zoom (traits toujours jointifs).
 painted_lines = []  # (LineString, largeur_m) pour l'anti-collision des étiquettes
 leaflet_tracks = []
 for canonical_edge, raw_users in segment_users.items():
     geom = get_edge_geom(canonical_edge[0], canonical_edge[1])
     for od_idx in sorted(raw_users):
         od = st.session_state.ods[od_idx]
-        shifted_geom = oriented_offset(geom, canonical_edge, od_idx)
-        if shifted_geom.is_empty:
+        shifted_geom = shifted.get((canonical_edge, od_idx))
+        if shifted_geom is None:
             continue
         for sid in canonical_edge:
             if sid in od.get('served_stations', []):
-                continue
-            if sid not in station_served_by:
                 continue
             obs = station_obstacle.get(sid)
             if obs is None:
@@ -1001,55 +935,55 @@ for canonical_edge, raw_users in segment_users.items():
             ax.plot(xs, ys, color=od['color'], linewidth=lw, zorder=4,
                     solid_capstyle='round', solid_joinstyle=join)
             painted_lines.append((ls, lw * meters_per_point))
-            leaflet_tracks.append({"xs": list(xs), "ys": list(ys), "color": od['color'], "weight": lw})
+        if not schema_mode:
+            base = geom.simplify(tol_simplif(canonical_edge), preserve_topology=False)
+            off_m = segment_offsets.get((canonical_edge, od_idx), 0.0)
+            off_m *= segment_sign.get(canonical_edge, 1.0)
+            for ls in _line_parts(base):
+                xs, ys = ls.xy
+                leaflet_tracks.append({
+                    "xs": list(xs), "ys": list(ys), "color": od['color'],
+                    "weight": lw, "offset": off_m / meters_per_point,
+                })
 
 # 7. Gares (Z-order: 5)
-#    - UNE mission : rond couleur, sans contour
+#    - UNE mission : rond couleur ∝ fréquence, liseré blanc (toujours visible
+#      sur son propre trait, en carte comme en schéma)
 #    - PLUSIEURS missions : capsule blanche type RATP, contour noir
 #    - personne ne s arrete : pas de symbole
 leaflet_stations = []
 station_rects = {}
 for sid in drawn_stations:
     x, y = pos[sid]
-    served = station_served_by.get(sid, [])
     nom = format_station(sid)
-    if served:
-        rad = station_radius.get(sid, min_sq / 2.0)
-        if len(served) == 1:
-            col = st.session_state.ods[served[0]]['color']
-            circ = Circle(
-                (x, y), rad,
-                facecolor=col,
-                edgecolor='none', linewidth=0, zorder=5,
-            )
-            circ.set_clip_on(True)
-            ax.add_patch(circ)
-            station_rects[sid] = (x - rad, y - rad, x + rad, y + rad)
-            leaflet_stations.append({
-                "kind": "circle", "x": x, "y": y, "color": col,
-                "radius_px": 4, "nom": nom,
-            })
-        else:
-            cap = station_capsule.get(sid)
-            if cap is None:
-                dx, dy = station_axis(sid)
-                px, py = -dy, dx
-                serving_w = sum(widths_by_od.get(idx, rad * 2) for idx in served)
-                cap = capsule_polygon(x, y, px, py, max(serving_w / 2.0, rad), rad)
-            coords = list(cap.exterior.coords)
-            poly = Polygon(coords, closed=True, facecolor='#FFFFFF', edgecolor='#111111',
-                           linewidth=1.7, zorder=5, joinstyle='round')
-            poly.set_clip_on(True)
-            ax.add_patch(poly)
-            xs_c = [c[0] for c in coords]
-            ys_c = [c[1] for c in coords]
-            station_rects[sid] = (min(xs_c), min(ys_c), max(xs_c), max(ys_c))
-            leaflet_stations.append({
-                "kind": "capsule", "xs": xs_c, "ys": ys_c, "nom": nom,
-            })
-    else:
+    sym = station_symbol.get(sid)
+    if sym is None:
         pad = meters_per_point * 4
         station_rects[sid] = (x - pad, y - pad, x + pad, y + pad)
+        continue
+    served = station_served_by[sid]
+    shape = sym["shape"]
+    if len(served) == 1:
+        col = st.session_state.ods[served[0]]['color']
+        patch = Circle((sym["x"], sym["y"]), sym["hl_m"], facecolor=col,
+                       edgecolor='white', linewidth=1.1, zorder=5)
+        kind = "circle"
+    else:
+        col = '#FFFFFF'
+        patch = Polygon(list(shape.exterior.coords), closed=True, facecolor=col,
+                        edgecolor='#111111', linewidth=1.4, zorder=5, joinstyle='round')
+        kind = "capsule"
+    patch.set_clip_on(True)
+    ax.add_patch(patch)
+    station_rects[sid] = shape.bounds
+    px, py = sym["perp"]
+    leaflet_stations.append({
+        "kind": kind, "x": x, "y": y, "color": col, "nom": nom,
+        "t": sym["t_m"] / meters_per_point,
+        "hl": sym["hl_m"] / meters_per_point,
+        "hw": sym["hw_m"] / meters_per_point,
+        "perp": [px, py],
+    })
 
 # 9. Etiquettes de gares avec anti-collision (gares + traces) et trait de rappel.
 #    - Mode carte : seules les gares de type a/b sont nommees (lisibilite du fond).
@@ -1271,14 +1205,14 @@ for sid in to_label:
             bbox=dict(facecolor='white', alpha=0.82, edgecolor='none', boxstyle='round,pad=0.2'))
     occupied.append(bbox)
 
-# 10. Fond de carte géographique OSM clair (mode carte uniquement ; le mode
-#     Schéma est volontairement dé-cartographié, sans fond géographique).
+# 10. Fond de plan (mode carte uniquement ; le mode Schéma est volontairement
+#     dé-cartographié). Plan IGN d'abord : les tuiles OSM répondent souvent
+#     par une image « 403 Access blocked » aux usages automatisés, qui ne lève
+#     aucune exception et finit imprimée dans l'export.
 if not schema_mode:
     try:
-        # OSM / Esri : sans clé. Carto Positron affiche « API KEY REQUIRED ».
         _basemap_ok = False
-        for _src in (cx.providers.OpenStreetMap.Mapnik,
-                     cx.providers.Esri.WorldGrayCanvas):
+        for _src in fournisseurs_tuiles(fond_carte):
             try:
                 cx.add_basemap(ax, crs=CRS_METRIC, source=_src, alpha=0.5, zorder=0)
                 _basemap_ok = True
@@ -1392,27 +1326,7 @@ def render_interactive_map(figure, height=760):
     components.html(html, height=height + 40)
 
 
-# --- Affichage Streamlit : carte et légende côte à côte, sans superposition ---
-col_map, col_leg = st.columns([4, 1])
-with col_map:
-    if schema_mode:
-        render_interactive_map(fig)
-    else:
-        try:
-            html = folium_map_html(leaflet_tracks, leaflet_stations, height=760, fond=fond_carte)
-            components.html(html, height=800)
-            st.caption(
-                "Carte interactive : molette = zoom (tuiles et tracé à l'échelle). "
-                "L'export PNG ci-dessous reste la vue d'ensemble."
-            )
-        except Exception:
-            st.warning("Carte interactive indisponible, affichage SVG de repli.")
-            render_interactive_map(fig)
-with col_leg:
-    st.markdown("**Légende**")
-    st.pyplot(fig_legend)
-
-# --- Exports PNG distincts (carte / légende) ---
+# --- Exports (en tête de page : visibles sans défiler sous la carte) ---
 buf_map = io.BytesIO()
 fig.savefig(buf_map, format="png", dpi=300, bbox_inches='tight', facecolor="white")
 buf_leg = io.BytesIO()
@@ -1421,28 +1335,33 @@ png_map = composer_png_avec_logo(buf_map.getvalue())
 png_leg = composer_png_avec_logo(buf_leg.getvalue(), largeur_frac=0.55)
 pdf_map = composer_pdf_depuis_png(png_map)
 
-dl1, dl2, dl3 = st.columns(3)
-with dl1:
-    st.download_button(
-        label="📥 Carte (PNG HD)",
-        data=png_map,
-        file_name="schema_reticufer_carte.png",
-        mime="image/png",
-        use_container_width=True,
-    )
-with dl2:
-    st.download_button(
-        label="📥 Légende (PNG)",
-        data=png_leg,
-        file_name="schema_reticufer_legende.png",
-        mime="image/png",
-        use_container_width=True,
-    )
-with dl3:
-    st.download_button(
-        label="📥 Carte (PDF)",
-        data=pdf_map,
-        file_name="schema_reticufer_carte.pdf",
-        mime="application/pdf",
-        use_container_width=True,
-    )
+with toolbar:
+    dl1, dl2, dl3 = st.columns(3)
+    with dl1:
+        st.download_button("📥 Carte (PNG HD)", data=png_map,
+                           file_name="schema_reticufer_carte.png", mime="image/png",
+                           use_container_width=True, type="primary")
+    with dl2:
+        st.download_button("📥 Carte (PDF)", data=pdf_map,
+                           file_name="schema_reticufer_carte.pdf", mime="application/pdf",
+                           use_container_width=True)
+    with dl3:
+        st.download_button("📥 Légende (PNG)", data=png_leg,
+                           file_name="schema_reticufer_legende.png", mime="image/png",
+                           use_container_width=True)
+
+# --- Carte et légende côte à côte, sans superposition ---
+col_map, col_leg = st.columns([4, 1])
+with col_map:
+    if schema_mode:
+        render_interactive_map(fig)
+    else:
+        try:
+            html = folium_map_html(leaflet_tracks, leaflet_stations, height=760, fond=fond_carte)
+            components.html(html, height=780)
+        except Exception:
+            st.warning("Carte interactive indisponible, affichage SVG de repli.")
+            render_interactive_map(fig)
+with col_leg:
+    st.markdown("**Légende**")
+    st.pyplot(fig_legend)
